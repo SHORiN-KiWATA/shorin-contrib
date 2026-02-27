@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# Description: 显示电池信息
 # 颜色定义
 BOLD='\033[1m'
 RED='\033[1;31m'

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+# Description: 快速读档，快照恢复
 # quickload - Btrfs Snapshot Quick Restore Script
 #
 

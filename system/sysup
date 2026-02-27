@@ -1,4 +1,5 @@
 #!/bin/bash
+# Description: 更新系统
 export SHELL="$(command -v bash)"
 # ===============================================================
 # Arch Linux 系统更新助手 (完美版 - 集成镜像源检查)
