@@ -42,7 +42,8 @@ if [[ "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" =~ zh_CN ]]; then
     MSG_LIST_CUSTOM="=== 可用的自定义快照描述 ==="
     MSG_LIST_ALL="=== 所有可用的快照描述 ==="
     MSG_LIST_EMPTY="未找到符合条件的快照描述。"
-    MSG_LIST_FMT="  - %-15s [配置: %-5s | ID: %-3s | 时间: %s]\n"
+    # 【优化项】: 增加青色高亮，并拓宽占位符为 25 以对齐长名称
+    MSG_LIST_FMT="  - \033[1;36m%-25s\033[0m [配置: %-5s | ID: %-3s | 时间: %s]\n"
     
     MSG_PROMPT="请输入序号: "
     MSG_INVALID="无效的选择，请重新输入。"
@@ -86,7 +87,8 @@ else
     MSG_LIST_CUSTOM="=== Available Custom Snapshot Descriptions ==="
     MSG_LIST_ALL="=== All Available Snapshot Descriptions ==="
     MSG_LIST_EMPTY="No matching snapshot descriptions found."
-    MSG_LIST_FMT="  - %-15s [Config: %-5s | ID: %-3s | Date: %s]\n"
+    # 【优化项】: 同步修改英文环境输出的高亮与宽度
+    MSG_LIST_FMT="  - \033[1;36m%-25s\033[0m [Config: %-5s | ID: %-3s | Date: %s]\n"
     
     MSG_PROMPT="Enter number: "
     MSG_INVALID="Invalid selection, please try again."
@@ -266,7 +268,7 @@ fi
 if [[ $OPT_LIST_CONFIGS -eq 1 ]]; then
     echo "$MSG_LIST_CONF"
     for conf in "${!CONFIG_MAP[@]}"; do
-        echo "  - $conf"
+        printf "  - \033[1;36m%s\033[0m\n" "$conf"
     done
     exit 0
 fi
@@ -347,7 +349,8 @@ list_snapshot_descriptions() {
     done
     
     if [[ ${#descs_raw[@]} -gt 0 ]]; then
-        readarray -t sorted_descs < <(printf "%s\n" "${descs_raw[@]}" | sort -t'|' -k1,1 -k2,2 -k3,3n)
+        # 【核心修复项】: 移除 -k1,1 按描述排序，改为按配置名分组，然后严格按时间线(ID)递增排序
+        readarray -t sorted_descs < <(printf "%s\n" "${descs_raw[@]}" | sort -t'|' -k2,2 -k3,3n)
         for entry in "${sorted_descs[@]}"; do
             IFS='|' read -r desc conf sid date <<< "$entry"
             printf "$MSG_LIST_FMT" "$desc" "$conf" "$sid" "$date"

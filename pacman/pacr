@@ -1,17 +1,20 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Description: 卸载软件的TUI
 # ==============================================================================
 # pacr - Fuzzy find and remove packages (Localized & Non-blocking)
 # ==============================================================================
-# tset
-set -o pipefail
+# 启用严格的错误处理机制
+set -euo pipefail
 
-# --- 1. Pre-Configuration ---
-ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG}}}"
+# --- 1. 环境与基础配置 ---
+ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
 SHOW_HELP=false
-QUERY_ARGS=""
+QUERY_ARGS=()
 
-# --- 2. Argument Parsing ---
+# 强制 C locale 确保 awk 解析的一致性
+export LC_ALL=C
+
+# --- 2. 参数解析 ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)
@@ -19,140 +22,160 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            # Collect search terms
-            QUERY_ARGS="$QUERY_ARGS $1"
+            QUERY_ARGS+=("$1")
             shift
             ;;
     esac
 done
-# Trim leading space
-QUERY_ARGS="${QUERY_ARGS# }"
 
-# --- 3. Auto-Detect Language ---
+# --- 3. 本地化多语言字典 ---
+declare -A MSG
 if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
-    UI_LANG="zh"
+    MSG[DESC]="模糊搜索并卸载已安装的软件包。"
+    MSG[OPTS]="选项："
+    MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
+    MSG[FEAT]="功能特性："
+    MSG[FEAT_1]="- 彻底卸载：递归删除依赖和配置 (-Rns)"
+    MSG[FEAT_2]="- 精准追溯：动态比对显示包的真实来源 (core/extra/archlinuxcn 等)"
+    MSG[FEAT_3]="- 视觉区分：蓝色(软件源) 紫色(AUR/本地)"
+    MSG[EX]="示例："
+    MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
+    MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
+    MSG[REMOVING]=">> 准备卸载："
+    MSG[HEADER]="Tab:多选 | Enter:卸载 | Esc:退出"
 else
-    UI_LANG="en"
+    MSG[DESC]="Fuzzy search & remove installed packages."
+    MSG[OPTS]="Options:"
+    MSG[OPT_HELP]="  --help, -h    Show this help and exit"
+    MSG[FEAT]="Features:"
+    MSG[FEAT_1]="- Clean Remove: Recursive w/ configs (-Rns)"
+    MSG[FEAT_2]="- Exact Origin: Dynamically maps package to real repo (core/extra etc.)"
+    MSG[FEAT_3]="- Visuals: Blue(Repo) Purple(AUR/Local)"
+    MSG[EX]="Example:"
+    MSG[ERR_FZF]="Error: fzf not found."
+    MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
+    MSG[REMOVING]=">> Preparing to remove:"
+    MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Esc:Exit"
 fi
 
-# --- 4. Environment Setup ---
-export LC_ALL=C
-
-# --- 5. Colors ---
-COLOR_OFF='\033[34m'
-COLOR_AUR='\033[35m'
-COLOR_RESET='\033[0m'
-
-# --- 6. Localization Table ---
-LANG_TABLE='
-MSG_USAGE_DESC    | Fuzzy search & remove installed packages.                  | 模糊搜索并卸载已安装的软件包。
-MSG_USAGE_FEAT    | Features:                                                  | 功能特性：
-MSG_FEAT_1        | - Clean Remove: Recursive w/ configs (-Rns)                | - 彻底卸载：递归删除依赖和配置 (-Rns)
-MSG_FEAT_2        | - Visuals: Blue(Native) Purple(AUR)                        | - 视觉区分：蓝色(官方源) 紫色(AUR)
-MSG_FEAT_3        | - Batch: Tab to select multiple                            | - 批量操作：Tab 多选，Enter 卸载
-MSG_USAGE_EX      | Example:                                                   | 示例：
-MSG_ERR_FZF       | Error: fzf not found.                                      | 错误：未找到 fzf。
-MSG_ERR_YAY       | Error: yay not found.                                      | 错误：未找到 yay。
-MSG_REMOVING      | >> Preparing to remove:                                    | >> 准备卸载：
-FZF_HEADER        | Tab:Multi-Select | Enter:Remove | Esc:Exit                 | Tab:多选 | Enter:卸载 | Esc:退出
-'
-
-while IFS='|' read -r v e c; do
-    v=$(printf '%s' "$v" | sed 's/^ *//;s/ *$//')
-    e=$(printf '%s' "$e" | sed 's/^ *//;s/ *$//')
-    c=$(printf '%s' "$c" | sed 's/^ *//;s/ *$//')
-    [ -z "$v" ] && continue
-    case "$v" in \#*) continue ;; esac
-    
-    if [ "$UI_LANG" = "zh" ]; then
-        eval "$v=\"$c\""
-    else
-        eval "$v=\"$e\""
-    fi
-done <<EOF
-$LANG_TABLE
-EOF
-
-# --- 7. Help Function ---
+# --- 4. 帮助信息拦截 ---
 if [ "$SHOW_HELP" = true ]; then
     cat <<EOF
-Usage: pacr [options] [query]
+Usage: ${0##*/} [options] [query]
 
-Options:
-  --help, -h    Show this help and exit
+${MSG[OPTS]}
+${MSG[OPT_HELP]}
 
 Description:
-  $MSG_USAGE_DESC
+  ${MSG[DESC]}
 
-$MSG_USAGE_FEAT
-  $MSG_FEAT_1
-  $MSG_FEAT_2
-  $MSG_FEAT_3
+${MSG[FEAT]}
+  ${MSG[FEAT_1]}
+  ${MSG[FEAT_2]}
+  ${MSG[FEAT_3]}
 
-$MSG_USAGE_EX
-  pacr firefox       # Search and remove 'firefox'
-  pacr               # List all installed packages
+${MSG[EX]}
+  ${0##*/} firefox        # 搜索并卸载 'firefox'
+  ${0##*/}                # 列出所有已安装的包
 EOF
     exit 0
 fi
 
-# --- 8. Dependency Check ---
-command -v fzf >/dev/null 2>&1 || { echo "$MSG_ERR_FZF" >&2; exit 1; }
-command -v yay >/dev/null 2>&1 || { echo "$MSG_ERR_YAY" >&2; exit 1; }
+# --- 5. 核心依赖检查与动态 Helper 探测 ---
+command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
 
-# --- 9. Async Logic Setup ---
+AUR_HELPER=""
+if command -v paru >/dev/null 2>&1; then
+    AUR_HELPER="paru"
+elif command -v yay >/dev/null 2>&1; then
+    AUR_HELPER="yay"
+else
+    echo "${MSG[ERR_HELPER]}" >&2
+    exit 1
+fi
 
-PREVIEW_CMD='yay -Qi {2}'
-
-# Temp files & FIFO
-TARGET_FILE=$(mktemp -t pacr_fzf.XXXXXX)
-PIPE_FIFO=$(mktemp -u)
+# --- 6. 异步逻辑与文件安全设置 ---
+TMP_DIR=$(mktemp -d -t pacr_fzf.XXXXXX)
+TARGET_FILE="${TMP_DIR}/target"
+PIPE_FIFO="${TMP_DIR}/fifo"
 mkfifo "$PIPE_FIFO"
 
-# Cleanup trap (Kill background process on exit)
+PREVIEW_CMD="$AUR_HELPER -Qi {2}"
+
 cleanup() {
-    if [ -n "$PID_GEN" ]; then kill "$PID_GEN" 2>/dev/null; fi
-    rm -f "$TARGET_FILE" "$PIPE_FIFO"
+    if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
+    rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
-# --- 10. Data Generation (Background) ---
-# Use subshell to run data collection in background
-(
-    # 1. Native Packages (Blue)
-    pacman -Qn | awk -v c="$COLOR_OFF" -v r="$COLOR_RESET" \
-        '{printf "%s%-10s%s %-30s %s\n", c, "local", r, $1, $2}'
+# --- 7. 数据生成器 (后台运行：智能源映射) ---
+# 提取为独立变量，避免嵌套导致单引号截断或转义错误
+AWK_CMD='
+    # 阶段 1: 读取 sync_db.txt，将源名称存入内存哈希表
+    NR==FNR {
+        if (!($2 in repo)) {
+            repo[$2] = $1
+        }
+        next
+    }
+    # 阶段 2: 读取 pacman -Q 当前已安装的包
+    {
+        pkg_name = $1
+        pkg_ver = $2
+        if (pkg_name in repo) {
+            # 存在于源中 -> 官方源或第三方源 (蓝色)
+            printf "%s%-16s%s %-30s %s\n", cb, repo[pkg_name], r, pkg_name, pkg_ver
+        } else {
+            # 不存在于源中 -> 纯正的外来/AUR包 (紫色)
+            printf "%s%-16s%s %-30s %s\n", cp, "aur", r, pkg_name, pkg_ver
+        }
+    }
+'
 
-    # 2. Foreign/AUR Packages (Purple)
-    pacman -Qm | awk -v c="$COLOR_AUR" -v r="$COLOR_RESET" \
-        '{printf "%s%-10s%s %-30s %s\n", c, "aur", r, $1, $2}'
+(
+    # 导出包含 repo 信息的源数据库清单 (输出格式: repo pkgname pkgver)
+    pacman --color=never -Sl > "${TMP_DIR}/sync_db.txt" || true
+
+    # 比对本地已安装包，精确追溯来源
+    pacman --color=never -Q | awk -v cb='\033[34m' -v cp='\033[35m' -v r='\033[0m' \
+        "$AWK_CMD" "${TMP_DIR}/sync_db.txt" -
 
 ) > "$PIPE_FIFO" 2>/dev/null &
 
 PID_GEN=$!
 
-# --- 11. Interactive FZF ---
+# --- 8. 交互式 FZF 渲染 ---
+COLOR_YELLOW=$'\033[33m'
+COLOR_RESET=$'\033[0m'
+FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+
+set +e
 fzf --multi --ansi \
     --preview "$PREVIEW_CMD" \
-    --preview-window=right:60%:wrap \
+    --preview-window=right:55%:wrap \
     --height=95% --layout=reverse --border \
     --tiebreak=index \
     --nth=2 \
     --header "$FZF_HEADER" \
-    --query "$QUERY_ARGS" \
+    --query "${QUERY_ARGS[*]:-}" \
     < "$PIPE_FIFO" \
     > "$TARGET_FILE"
+FZF_EXIT=$?
+set -e
 
-# --- 12. Execution ---
-if [ -s "$TARGET_FILE" ]; then
-    # Extract only the package name (column 2)
-    PACKAGES=$(awk '{print $2}' "$TARGET_FILE" | tr '\n' ' ')
+# --- 9. 执行卸载 ---
+if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
+    mapfile -t SELECTED_LINES < "$TARGET_FILE"
+    PACKAGES=()
+    for line in "${SELECTED_LINES[@]}"; do
+        pkg=$(echo "$line" | awk '{print $2}')
+        [[ -n "$pkg" ]] && PACKAGES+=("$pkg")
+    done
     
-    if [ -n "$PACKAGES" ]; then
-        echo -e "\n${COLOR_OFF}${MSG_REMOVING}${COLOR_RESET}"
-        echo "$PACKAGES"
+    if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+        echo -e "\n\033[34m${MSG[REMOVING]}\033[0m"
+        echo "${PACKAGES[*]}"
         echo "----------------------------------------"
-        # -Rns: Recursive remove + configs + unused dependencies
-        yay -Rns $PACKAGES
+        "$AUR_HELPER" -Rns "${PACKAGES[@]}"
     fi
 fi

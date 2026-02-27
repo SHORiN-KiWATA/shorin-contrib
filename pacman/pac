@@ -1,129 +1,134 @@
-#!/bin/bash
-# Description: 安装软件的TUI
+#!/usr/bin/env bash
+# Description: 软件包模糊搜索与安装 TUI
 # ==============================================================================
-# pac - Fuzzy search and install packages (Localized & Non-blocking)
-# ==============================================================================
-set -o pipefail
-# --- 1. Pre-Configuration ---
-ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG}}}"
-SHOW_HELP=false
-QUERY_ARGS=""
+# 启用严格的错误处理机制
+set -euo pipefail
 
-# --- 2. Argument Parsing ---
+# --- 1. 环境与基础配置 ---
+ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
+SHOW_HELP=false
+FORCE_REFRESH=false
+QUERY_ARGS=()
+
+# 强制 C locale 确保 awk 解析的一致性
+export LC_ALL=C
+
+# --- 2. 参数解析 ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)
             SHOW_HELP=true
             shift
             ;;
+        --refresh|-y)
+            FORCE_REFRESH=true
+            shift
+            ;;
         *)
-            # Collect search terms
-            QUERY_ARGS="$QUERY_ARGS $1"
+            # 收集搜索关键字
+            QUERY_ARGS+=("$1")
             shift
             ;;
     esac
 done
-# Trim leading space
-QUERY_ARGS="${QUERY_ARGS# }"
 
-# --- 3. Auto-Detect Language ---
+# --- 3. 本地化多语言字典 (使用安全的关联数组) ---
+declare -A MSG
 if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
-    UI_LANG="zh"
+    MSG[DESC]="模糊搜索并安装软件包 (支持官方源和 AUR)。"
+    MSG[OPTS]="选项："
+    MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
+    MSG[OPT_REFRESH]="  --refresh, -y 强制拉取并刷新 AUR 软件包本地缓存列表"
+    MSG[FEAT]="功能特性："
+    MSG[FEAT_1]="- 准确状态：显示 [已安装] 标记"
+    MSG[FEAT_2]="- 视觉区分：蓝色(官方) 紫色(AUR)"
+    MSG[FEAT_3]="- 智能降级：自动探测使用 paru 或 yay"
+    MSG[EX]="示例："
+    MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
+    MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
+    MSG[INSTALLED]="[已安装]"
+    MSG[INSTALLING]=">> 准备安装："
+    MSG[HEADER]="Tab:多选 | Enter:安装 | Esc:退出"
 else
-    UI_LANG="en"
+    MSG[DESC]="Fuzzy search & install packages (Repo + AUR)."
+    MSG[OPTS]="Options:"
+    MSG[OPT_HELP]="  --help, -h    Show this help and exit"
+    MSG[OPT_REFRESH]="  --refresh, -y Force refresh AUR package cache list"
+    MSG[FEAT]="Features:"
+    MSG[FEAT_1]="- Accurate status: [Installed] tag"
+    MSG[FEAT_2]="- Visuals: Blue(Repo) Purple(AUR)"
+    MSG[FEAT_3]="- Smart Fallback: Auto-detects paru or yay"
+    MSG[EX]="Example:"
+    MSG[ERR_FZF]="Error: fzf not found."
+    MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
+    MSG[INSTALLED]="[Installed]"
+    MSG[INSTALLING]=">> Installing:"
+    MSG[HEADER]="Tab:Multi-Select | Enter:Install | Esc:Exit"
 fi
 
-# --- 4. Environment Setup ---
-# Force C locale for consistent pacman/awk parsing
-export LC_ALL=C
-
-# --- 5. Colors ---
-COLOR_OFF='\033[34m'
-COLOR_AUR='\033[35m'
-COLOR_INST='\033[32m'
-COLOR_RESET='\033[0m'
-
-# --- 6. Localization Table ---
-LANG_TABLE='
-MSG_USAGE_DESC    | Fuzzy search & install packages (Repo + AUR).              | 模糊搜索并安装软件包 (支持官方源和 AUR)。
-MSG_USAGE_FEAT    | Features:                                                  | 功能特性：
-MSG_FEAT_1        | - Accurate status: [Installed] tag                         | - 准确状态：显示 [已安装] 标记
-MSG_FEAT_2        | - Visuals: Blue(Repo) Purple(AUR)                          | - 视觉区分：蓝色(官方) 紫色(AUR)
-MSG_FEAT_3        | - Batch: Tab to select multiple                            | - 批量操作：Tab 多选，Enter 安装
-MSG_USAGE_EX      | Example:                                                   | 示例：
-MSG_ERR_FZF       | Error: fzf not found.                                      | 错误：未找到 fzf。
-MSG_ERR_YAY       | Error: yay not found.                                      | 错误：未找到 yay。
-MSG_INSTALLED     | [Installed]                                                | [已安装]
-MSG_INSTALLING    | >> Installing:                                             | >> 准备安装：
-FZF_HEADER        | Tab:Multi-Select | Enter:Install | Esc:Exit                | Tab:多选 | Enter:安装 | Esc:退出
-'
-
-while IFS='|' read -r v e c; do
-    v=$(printf '%s' "$v" | sed 's/^ *//;s/ *$//')
-    e=$(printf '%s' "$e" | sed 's/^ *//;s/ *$//')
-    c=$(printf '%s' "$c" | sed 's/^ *//;s/ *$//')
-    [ -z "$v" ] && continue
-    case "$v" in \#*) continue ;; esac
-    
-    if [ "$UI_LANG" = "zh" ]; then
-        eval "$v=\"$c\""
-    else
-        eval "$v=\"$e\""
-    fi
-done <<EOF
-$LANG_TABLE
-EOF
-
-# --- 7. Help Function ---
+# --- 4. 帮助信息拦截 ---
 if [ "$SHOW_HELP" = true ]; then
     cat <<EOF
-Usage: pac [options] [query]
+Usage: ${0##*/} [options] [query]
 
-Options:
-  --help, -h    Show this help and exit
+${MSG[OPTS]}
+${MSG[OPT_HELP]}
+${MSG[OPT_REFRESH]}
 
 Description:
-  $MSG_USAGE_DESC
+  ${MSG[DESC]}
 
-$MSG_USAGE_FEAT
-  $MSG_FEAT_1
-  $MSG_FEAT_2
-  $MSG_FEAT_3
+${MSG[FEAT]}
+  ${MSG[FEAT_1]}
+  ${MSG[FEAT_2]}
+  ${MSG[FEAT_3]}
 
-$MSG_USAGE_EX
-  pac firefox        # Search for 'firefox'
-  pac                # List all packages
+${MSG[EX]}
+  ${0##*/} firefox        # 搜索 'firefox'
+  ${0##*/} -y             # 强制刷新 AUR 列表并列出所有包
 EOF
     exit 0
 fi
 
-# --- 8. Dependency Check ---
-command -v fzf >/dev/null 2>&1 || { echo "$MSG_ERR_FZF" >&2; exit 1; }
-command -v yay >/dev/null 2>&1 || { echo "$MSG_ERR_YAY" >&2; exit 1; }
+# --- 5. 核心依赖检查与动态 Helper 探测 ---
+command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
 
-# --- 9. Async Logic Setup ---
+# 动态绑定 AUR 助手 (paru 优先，yay 兜底)
+AUR_HELPER=""
+if command -v paru >/dev/null 2>&1; then
+    AUR_HELPER="paru"
+elif command -v yay >/dev/null 2>&1; then
+    AUR_HELPER="yay"
+else
+    echo "${MSG[ERR_HELPER]}" >&2
+    exit 1
+fi
 
-AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
-PREVIEW_CMD='yay -Si {2}'
-
-# Temp files & FIFO
-TARGET_FILE=$(mktemp -t pac_fzf.XXXXXX)
-INSTALLED_LIST=$(mktemp -t pac_installed.XXXXXX)
-PIPE_FIFO=$(mktemp -u)
+# --- 6. 异步逻辑与文件安全设置 (XDG 规范缓存) ---
+TMP_DIR=$(mktemp -d -t pac_fzf.XXXXXX)
+TARGET_FILE="${TMP_DIR}/target"
+INSTALLED_LIST="${TMP_DIR}/installed"
+PIPE_FIFO="${TMP_DIR}/fifo"
 mkfifo "$PIPE_FIFO"
 
-# Cache installed list
-pacman -Qq > "$INSTALLED_LIST"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pac_tui"
+mkdir -p "$CACHE_DIR"
 
-# Cleanup trap (Kill background process on exit)
+AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
+CACHE_TIME=3600 # 缓存过期时间 (秒)
+
+AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
+PREVIEW_CMD="$AUR_HELPER -Si {2}"
+
+pacman -Qq > "$INSTALLED_LIST" || true
+
 cleanup() {
-    if [ -n "$PID_GEN" ]; then kill "$PID_GEN" 2>/dev/null; fi
-    rm -f "$TARGET_FILE" "$INSTALLED_LIST" "$PIPE_FIFO"
+    if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
+    rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
-# --- 10. Data Generation (Background) ---
-
+# --- 7. 数据生成器 (后台运行) ---
 AWK_CMD='
     FNR==NR { installed[$1]=1; next }
     {
@@ -133,40 +138,60 @@ AWK_CMD='
 '
 
 (
-    # Official
-    pacman -Sl | awk -v c="$COLOR_OFF" -v ci="$COLOR_INST" -v r="$COLOR_RESET" \
-        -v label="$MSG_INSTALLED" \
+    # 1. 官方源数据
+    pacman -Sl | awk -v c='\033[34m' -v ci='\033[32m' -v r='\033[0m' \
+        -v label="${MSG[INSTALLED]}" \
         "$AWK_CMD" "$INSTALLED_LIST" -
 
-    # AUR
-    yay -Sl aur | grep -vE "$AUR_FILTER" | \
-        awk -v c="$COLOR_AUR" -v ci="$COLOR_INST" -v r="$COLOR_RESET" \
-        -v label="$MSG_INSTALLED" \
-        "$AWK_CMD" "$INSTALLED_LIST" -
+    # 2. AUR 数据
+    if [[ "$FORCE_REFRESH" == true ]] || [[ ! -f "$AUR_CACHE" ]] || [[ $(find "$AUR_CACHE" -mmin +$((CACHE_TIME / 60)) 2>/dev/null) ]]; then
+        curl -sL https://aur.archlinux.org/packages.gz | zcat > "$AUR_CACHE" || true
+    fi
+
+    if [[ -s "$AUR_CACHE" ]]; then
+        grep -vE "$AUR_FILTER" "$AUR_CACHE" 2>/dev/null | \
+        awk '{print "aur", $1, "-"}' | \
+        awk -v c='\033[35m' -v ci='\033[32m' -v r='\033[0m' \
+            -v label="${MSG[INSTALLED]}" \
+            "$AWK_CMD" "$INSTALLED_LIST" -
+    fi
 ) > "$PIPE_FIFO" 2>/dev/null &
 
 PID_GEN=$!
 
-# --- 11. Interactive FZF ---
+# --- 8. 交互式 FZF 渲染 ---
+# 使用 ANSI-C 引用的方式将真实的颜色字节注入变量
+COLOR_YELLOW=$'\033[33m'
+COLOR_RESET=$'\033[0m'
+FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+
+set +e
 fzf --multi --ansi \
     --preview "$PREVIEW_CMD" \
-    --preview-window=right:50%:wrap \
+    --preview-window=right:55%:wrap \
     --height=95% --layout=reverse --border \
     --tiebreak=index \
     --nth=2 \
     --header "$FZF_HEADER" \
-    --query "$QUERY_ARGS" \
+    --query "${QUERY_ARGS[*]:-}" \
     < "$PIPE_FIFO" \
     > "$TARGET_FILE"
+FZF_EXIT=$?
+set -e
 
-# --- 12. Execution ---
-if [ -s "$TARGET_FILE" ]; then
-    PACKAGES=$(awk '{print $2}' "$TARGET_FILE" | tr '\n' ' ')
+# --- 9. 执行安装 ---
+if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
+    mapfile -t SELECTED_LINES < "$TARGET_FILE"
+    PACKAGES=()
+    for line in "${SELECTED_LINES[@]}"; do
+        pkg=$(echo "$line" | awk '{print $2}')
+        [[ -n "$pkg" ]] && PACKAGES+=("$pkg")
+    done
     
-    if [ -n "$PACKAGES" ]; then
-        echo -e "\n${COLOR_INST}${MSG_INSTALLING}${COLOR_RESET}"
-        echo "$PACKAGES"
+    if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+        echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
+        echo "${PACKAGES[*]}"
         echo "----------------------------------------"
-        yay -S $PACKAGES
+        "$AUR_HELPER" -S "${PACKAGES[@]}"
     fi
 fi
