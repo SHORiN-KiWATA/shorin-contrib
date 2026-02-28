@@ -168,7 +168,7 @@ FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
 set +e
 fzf --multi --ansi \
     --preview "$PREVIEW_CMD" \
-    --preview-window=right:55%:wrap \
+    --preview-window=down:55%:wrap \
     --height=95% --layout=reverse --border \
     --tiebreak=index \
     --nth=2 \
