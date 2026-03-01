@@ -275,10 +275,10 @@ check_mirror_age() {
 # 8. Update Function
 # ------------------------------
 perform_update() {
-  if command -v quicksave >/dev/null 2>&1; then
+if command -v quicksave >/dev/null 2>&1 && [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]]; then 
     _log "${MSG[SNAP]}"
     quicksave -d quicksave-sysup
-  fi
+fi
 
   check_mirror_age
 
