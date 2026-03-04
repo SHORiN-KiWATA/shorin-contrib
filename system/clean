@@ -9,7 +9,7 @@
 # 5. 清空用户回收站 (Trash) 和缩略图缓存 (Thumbnails)
 # 6. 移除未使用的 Flatpak 运行时
 # 7. 清理截图与录屏目录 (Screenshots & wf-recorder)
-# 8. 清理旧 Btrfs 快照与 btrfs-assistant 的冗余备份子卷 (all 模式下清空所有快照)
+# 8. 清理旧 Btrfs 快照与 btrfs-assistant 的冗余备份子卷 (all 模式下利用 snapper 命令清空快照但保留 before 节点)
 
 set -euo pipefail
 export SHELL="$(command -v bash || echo /bin/bash)"
@@ -76,7 +76,7 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[DESC_7]="7. 清理旧 Btrfs 快照与冗余备份子卷"
   
   MSG[DESC_ALL_1]="* [ALL模式] 完全清空所有软件包缓存 (-Scc)"
-  MSG[DESC_ALL_2]="* [ALL模式] 删除所有 Btrfs 快照 (依赖 quicksave)"
+  MSG[DESC_ALL_2]="* [ALL模式] 删除所有 Btrfs 快照 (保留 Before 节点)"
 
   MSG[ASK_CONFIRM]="是否继续执行清理？[Y/n]"
   MSG[ABORT]="用户已取消清理。"
@@ -108,9 +108,9 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[MEDIA_DONE]="截图和录屏文件已清理。"
 
   MSG[STEP_SNAP]="正在清理超出配额的旧 Btrfs 快照..."
-  MSG[SNAP_DONE]="旧快照已按配额清理。"
-  MSG[STEP_QUICKSAVE]="正在使用 quicksave 清空所有快照..."
-  MSG[QUICKSAVE_DONE]="所有 Btrfs 快照配置已清空。"
+  MSG[SNAP_DONE]="旧快照已按配额自动清理完成。"
+  MSG[STEP_CLEAR_SNAP]="正在利用 snapper 清空所有快照 (保留 Before 节点)..."
+  MSG[CLEAR_SNAP_DONE]="所有指定的 Btrfs 快照已彻底清理。"
   MSG[STEP_BTRFS_BA]="正在检查 btrfs-assistant 冗余备份子卷..."
   MSG[BTRFS_BA_DONE]="冗余备份子卷已删除。"
   MSG[BTRFS_BA_NONE]="未发现冗余备份子卷。"
@@ -131,7 +131,7 @@ else
   MSG[DESC_7]="7. Clean old btrfs snapshots & backup subvols"
 
   MSG[DESC_ALL_1]="* [ALL MODE] Completely clear package cache (-Scc)"
-  MSG[DESC_ALL_2]="* [ALL MODE] Delete all btrfs snapshots (quicksave)"
+  MSG[DESC_ALL_2]="* [ALL MODE] Delete all btrfs snapshots (keep 'Before' nodes)"
 
   MSG[ASK_CONFIRM]="Continue with cleanup? [Y/n]"
   MSG[ABORT]="Cleanup cancelled by user."
@@ -164,8 +164,8 @@ else
 
   MSG[STEP_SNAP]="Cleaning old btrfs snapshots..."
   MSG[SNAP_DONE]="Old snapshots cleaned."
-  MSG[STEP_QUICKSAVE]="Clearing all snapshots using quicksave..."
-  MSG[QUICKSAVE_DONE]="All btrfs snapshots cleared."
+  MSG[STEP_CLEAR_SNAP]="Clearing all snapshots using snapper (keeping 'Before' nodes)..."
+  MSG[CLEAR_SNAP_DONE]="All specified btrfs snapshots cleared."
   MSG[STEP_BTRFS_BA]="Checking btrfs-assistant backup subvolumes..."
   MSG[BTRFS_BA_DONE]="Backup subvolumes cleaned."
   MSG[BTRFS_BA_NONE]="No redundant backup subvolumes found."
@@ -307,23 +307,59 @@ _success "${MSG[MEDIA_DONE]}"
 # [8] Btrfs Snapshots & Backup Subvolumes
 if command -v btrfs >/dev/null 2>&1 && findmnt -f -n -o FSTYPE / | grep -q btrfs; then
   
-# 8.1 Snapper / Quicksave
-  if [[ "$CLEAN_ALL" == true ]] && command -v quicksave >/dev/null 2>&1 && command -v snapper >/dev/null 2>&1; then
-    _info "${MSG[STEP_QUICKSAVE]}"
-    while IFS= read -r conf; do
-      [[ -z "$conf" ]] && continue
-      # 移除重定向，直接在终端展示 quicksave 自身的清晰日志输出
-      quicksave -c "$conf" -del all || true
-    done < <(quicksave -lc 2>/dev/null)
-    # 删除了原有的 _success "${MSG[QUICKSAVE_DONE]}" 避免信息冗余
-  elif command -v snapper >/dev/null 2>&1; then
-    _info "${MSG[STEP_SNAP]}"
-    while IFS= read -r conf; do
-      [[ -z "$conf" ]] && continue
-      sudo snapper -c "$conf" cleanup number >/dev/null 2>&1 || true
-      sudo snapper -c "$conf" cleanup timeline >/dev/null 2>&1 || true
-    done < <(snapper list-configs 2>/dev/null | awk 'NR>2 {print $1}')
-    _success "${MSG[SNAP_DONE]}"
+  # 8.1 Snapper Snapshots
+  if command -v snapper >/dev/null 2>&1; then
+    if [[ "$CLEAN_ALL" == true ]]; then
+      _info "${MSG[STEP_CLEAR_SNAP]}"
+      
+      # 强制使用 LC_ALL=C 能够防止因为本地化差异导致表格列分隔符变成特殊字符
+      while IFS= read -r conf; do
+        conf=$(echo "$conf" | xargs)
+        [[ -z "$conf" ]] && continue
+        
+        # 判断当前执行用户是否有权获取配置
+        if ! snapper -c "$conf" get-config >/dev/null 2>&1; then
+          sudo snapper -c "$conf" set-config ALLOW_GROUPS=wheel SYNC_ACL=yes >/dev/null 2>&1 || true
+        fi
+        
+        # 解析快照列表并清理 (LC_ALL=C 强制以标准竖线 | 作为分隔符，安全健壮)
+        while IFS='|' read -r snap_id snap_type snap_pre snap_date snap_user snap_cleanup snap_desc snap_userdata; do
+          snap_id=$(echo "$snap_id" | xargs)
+          snap_desc=$(echo "$snap_desc" | xargs)
+
+          # 过滤表头横线以及非数字的 ID
+          [[ ! "$snap_id" =~ ^[0-9]+$ ]] && continue
+          # 0 永远是指向当前系统的节点，绝不能删除
+          [[ "$snap_id" == "0" ]] && continue
+
+          # 【核心逻辑】：如果描述以 Before 或 before 开头，则保留该节点
+          if [[ "${snap_desc,,}" == before* ]]; then
+            continue
+          fi
+
+          # 调用原生 snapper delete 批量移除符合条件的废弃快照并打印炫酷日志
+          if sudo snapper -c "$conf" delete "$snap_id" >/dev/null 2>&1; then
+            # 兼容空描述的情况，防止日志错位
+            [[ -z "$snap_desc" ]] && snap_desc="N/A"
+            printf "  ${H_CYAN}Removed Snapshot:${NC} [%-4s] ID: %-3s | Desc: %s\n" "$conf" "$snap_id" "$snap_desc"
+          fi
+        done < <(sudo LC_ALL=C snapper -c "$conf" list 2>/dev/null)
+        
+      done < <(sudo LC_ALL=C snapper list-configs 2>/dev/null | awk -F '|' 'NR>2 {print $1}')
+      _success "${MSG[CLEAR_SNAP_DONE]}"
+      
+    else
+      # 普通模式执行内置自动清理规则
+      _info "${MSG[STEP_SNAP]}"
+      while IFS= read -r conf; do
+        conf=$(echo "$conf" | xargs)
+        [[ -z "$conf" ]] && continue
+        if sudo snapper -c "$conf" cleanup number >/dev/null 2>&1 && sudo snapper -c "$conf" cleanup timeline >/dev/null 2>&1; then
+           printf "  ${H_CYAN}Auto-Cleanup Executed:${NC} [%-4s]\n" "$conf"
+        fi
+      done < <(sudo LC_ALL=C snapper list-configs 2>/dev/null | awk -F '|' 'NR>2 {print $1}')
+      _success "${MSG[SNAP_DONE]}"
+    fi
   fi
 
   # 8.2 btrfs-assistant backups (解决 Root 权限读取挂载点问题)
@@ -337,7 +373,7 @@ if command -v btrfs >/dev/null 2>&1 && findmnt -f -n -o FSTYPE / | grep -q btrfs
     while IFS= read -r -d '' subvol_dir; do
       if sudo btrfs subvolume show "$subvol_dir" >/dev/null 2>&1; then
         sudo btrfs subvolume delete "$subvol_dir" >/dev/null 2>&1 || true
-        printf "  Removed Backup Subvolume: %s\n" "$(basename "$subvol_dir")"
+        printf "  ${H_CYAN}Removed Backup Subvol:${NC} %s\n" "$(basename "$subvol_dir")"
         found_backups=1
       fi
     done < <(sudo find "$MNT_DIR" -maxdepth 1 -type d -name "*_backup_20*" -print0 2>/dev/null)
