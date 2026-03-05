@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# Description: 卸载软件前识别残留配置文件
+# ==============================================================================
+# 脚本名称: appclean
+# 功能描述:
+#   1. 通过 strace 动态追踪指定软件的运行，捕获其读取或写入的文件路径。
+#   2. [体验满分] 引入 Awk 启发式打分排序算法，将高度相似目录和核心配置强行置顶。
+#   3. 前置严格校验传入的命令或路径是否合法，失败则快速退出。
+#   4. 默认开启智能感知：实时监控读写并在稳定后自动结束，最大超时默认为 10 秒。
+#   5. 支持 -k 保持常驻运行，直到手动关闭软件或按回车强制结束。
+#   6. 使用 UNIX 进程组 (PGID) 机制关闭软件，完美击杀多进程流氓软件。
+#   7. 智能归类 ~/.config, ~/.cache, ~/.local 下的标准软件配置目录。
+#   8. 智能上下文动态豁免机制：自动过滤环境注入组件，明确追踪时解除过滤。
+#   9. 提供 fzf 菜单清理。卸载阶段默认选择 [Y]，回车一键放行。
+# ==============================================================================
+
+set -euo pipefail
+
+# --- 颜色定义 ---
+readonly C_RED='\033[0;31m'
+readonly C_GREEN='\033[0;32m'
+readonly C_YELLOW='\033[0;33m'
+readonly C_CYAN='\033[0;36m'
+readonly C_BLUE='\033[0;34m'
+readonly C_RESET='\033[0m'
+
+# --- 检查依赖 ---
+for cmd in strace fzf awk; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo -e "${C_RED}[!] 错误: 未找到依赖 '$cmd'，请先安装。${C_RESET}" >&2
+        exit 1
+    fi
+done
+
+usage() {
+    echo -e "${C_BLUE}用法:${C_RESET} $0 [选项] <软件命令或AppImage路径> [参数...]"
+    echo -e "${C_CYAN}选项:${C_RESET}"
+    echo "  -t, --timeout <秒数>  设置自动收集的最大超时时间 (默认: 10)"
+    echo "  -k, --keep-alive      保持追踪不自动退出，直到手动关闭软件或按回车强制结束"
+    echo -e "${C_CYAN}示例:${C_RESET}"
+    echo "  $0 code                # 智能模式：监控配置读写，读写稳定后自动退出"
+    echo "  $0 -t 20 linuxqq       # 放宽限制：智能模式，最长等待 20 秒"
+    echo "  $0 -k wechat           # 常驻模式：一直追踪，直到按回车"
+}
+
+# --- 解析参数 ---
+TIMEOUT=10
+KEEP_ALIVE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -k|--keep-alive) KEEP_ALIVE=1; shift ;;
+        -t|--timeout)
+            if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+                TIMEOUT="$2"
+                shift 2
+            else
+                echo -e "${C_RED}[!] 错误: -t 后面必须指定一个有效的数字作为秒数。${C_RESET}" >&2
+                exit 1
+            fi
+        ;;
+        -*) echo -e "${C_RED}[!] 未知参数: $1${C_RESET}" >&2; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+APP_CMD="$1"
+
+# --- 飞行前检查：验证命令或可执行文件是否存在 ---
+if ! command -v "$APP_CMD" >/dev/null 2>&1; then
+    if [[ "$APP_CMD" == ./* || "$APP_CMD" == /* || "$APP_CMD" == ~/* ]]; then
+        echo -e "${C_RED}[!] 错误: 找不到可执行文件 '$APP_CMD'，请检查路径是否存在或具有执行权限。${C_RESET}" >&2
+    else
+        echo -e "${C_RED}[!] 错误: 未在系统中找到命令 '$APP_CMD'，请检查拼写或是否已安装。${C_RESET}" >&2
+    fi
+    exit 1
+fi
+
+TRACE_FILE=$(mktemp /tmp/appclean_trace.XXXXXX)
+CANDIDATES=$(mktemp /tmp/appclean_candidates.XXXXXX)
+
+cleanup() {
+    rm -f "$TRACE_FILE" "$CANDIDATES"
+}
+trap cleanup EXIT
+
+# --- 核心提取函数 (静默运行) ---
+extract_candidates() {
+    awk -v home="$HOME" '
+    {
+        while (match($0, /"[^"]+"/)) {
+            path = substr($0, RSTART+1, RLENGTH-2)
+            if (index(path, home) == 1 && path != home && path != home "/") {
+                rel = substr(path, length(home) + 2)
+                split(rel, parts, "/")
+
+                if (parts[1] == ".config" || parts[1] == ".cache") {
+                    if (length(parts[2]) > 0) print home "/" parts[1] "/" parts[2]
+                } else if (parts[1] == ".local" && (parts[2] == "share" || parts[2] == "state")) {
+                    if (length(parts[3]) > 0) print home "/" parts[1] "/" parts[2] "/" parts[3]
+                } else if (substr(parts[1], 1, 1) == "." && parts[1] != ".local" && parts[1] != ".config" && parts[1] != ".cache") {
+                    print home "/" parts[1]
+                } else {
+                    print path
+                }
+            }
+            $0 = substr($0, RSTART+RLENGTH)
+        }
+    }' "$TRACE_FILE" | sort -u
+}
+
+# --- 启动并追踪软件 ---
+set -m
+env APPIMAGE_EXTRACT_AND_RUN=1 strace -f -e trace=%file -o "$TRACE_FILE" "$@" >/dev/null 2>&1 &
+STRACE_PID=$!
+set +m
+disown "$STRACE_PID"
+
+echo -e "${C_CYAN}[*] 正在启动并追踪: ${C_YELLOW}$*${C_RESET} (PGID: $STRACE_PID)"
+
+# --- 进程生命周期管理 ---
+if [[ $KEEP_ALIVE -eq 1 ]]; then
+    echo -e "${C_YELLOW}[!] 正在收集配置信息。请在操作完成后手动关闭软件，或按 [回车键] 结束。${C_RESET}"
+    while kill -0 "$STRACE_PID" 2>/dev/null; do
+        if read -r -t 1; then
+            break
+        fi
+    done
+else
+    echo -e "${C_YELLOW}[!] 正在收集配置信息 (自动模式，最大等待 ${TIMEOUT}s)...${C_RESET}"
+    PREV_COUNT=0
+    STABLE_TICKS=0
+    
+    for ((i=1; i<=TIMEOUT; i++)); do
+        if read -r -t 1; then break; fi
+        if ! kill -0 "$STRACE_PID" 2>/dev/null; then break; fi
+        
+        CUR_COUNT=$(extract_candidates | wc -l)
+        if [[ $CUR_COUNT -gt 0 ]]; then
+            if [[ $CUR_COUNT -eq $PREV_COUNT ]]; then
+                STABLE_TICKS=$((STABLE_TICKS + 1))
+                if [[ $STABLE_TICKS -ge 2 ]]; then break; fi
+            else
+                STABLE_TICKS=0
+            fi
+        fi
+        PREV_COUNT=$CUR_COUNT
+    done
+fi
+
+if kill -0 "$STRACE_PID" 2>/dev/null; then
+    echo -e "${C_CYAN}[*] 正在清理后台进程并分析数据...${C_RESET}"
+    kill -TERM -- -"$STRACE_PID" 2>/dev/null || true
+    sleep 0.5
+    kill -KILL -- -"$STRACE_PID" 2>/dev/null || true
+else
+    echo -e "${C_CYAN}[*] 正在分析数据...${C_RESET}"
+fi
+
+extract_candidates > "$CANDIDATES".raw
+
+# --- 构建上下文感知的动态黑名单 ---
+APP_BASENAME=$(basename "$APP_CMD" | tr '[:upper:]' '[:lower:]')
+INJECT_COMPONENTS=("fontconfig" "dconf" "mime" "gtk-[0-9.]+" "qt[0-9]+" "pulse" "pipewire" "systemd" "dbus-[0-9]+" "xorg" "gvfs" "ibus" "fcitx[0-9]*" "mozc" "glib-[0-9.]+" "lsfg-.*" "mesa_shader_cache" "radv_builtin_shaders" "gstreamer-[0-9.]+" "thumbnails" "applications" "icons" "fonts" "Trash" "gvfs-metadata" "flatpak" "themes" "vulkan")
+
+DYN_EXCLUDES=""
+for key in "${INJECT_COMPONENTS[@]}"; do
+    if [[ ! "$APP_BASENAME" =~ $key ]]; then
+        DYN_EXCLUDES="${DYN_EXCLUDES:+$DYN_EXCLUDES|}$key"
+    fi
+done
+
+HOME_INJECTS=("\.nv")
+DYN_HOME=""
+for key in "${HOME_INJECTS[@]}"; do
+    clean_key="${key//\\/}"
+    if [[ ! "$APP_BASENAME" =~ $clean_key ]]; then
+        DYN_HOME="${DYN_HOME:+$DYN_HOME|}$key"
+    fi
+done
+
+EXCLUDE_DIRS="\.config/($DYN_EXCLUDES)|\.cache/($DYN_EXCLUDES)|\.local/share/($DYN_EXCLUDES)"
+if [[ -n "$DYN_HOME" ]]; then
+    EXCLUDE_DIRS="$EXCLUDE_DIRS|$DYN_HOME"
+fi
+
+EXCLUDE_DIRS="$EXCLUDE_DIRS|\.ssh|\.gnupg|\.dbus|\.config/user-dirs.*"
+EXCLUDE_FILES="\.bash_history|\.zsh_history|\.bashrc|\.zshrc|\.profile|\.xinitrc|\.Xauthority|\.ICEauthority|\.xsession-errors.*"
+
+# --- 执行过滤并使用 Awk 进行启发式相关性排序 ---
+grep -E -v "^$HOME/($EXCLUDE_DIRS)" "$CANDIDATES".raw | grep -E -v "^$HOME/($EXCLUDE_FILES)$" | while read -r item; do
+    if [[ ! -e "$item" ]]; then continue; fi
+    if [[ "$item" == "$HOME/.local" || "$item" == "$HOME/.config" || "$item" == "$HOME/.cache" ]]; then continue; fi
+    
+    if [[ "$item" == "$HOME/.config/"* || "$item" == "$HOME/.cache/"* || "$item" == "$HOME/.local/share/"* || "$item" == "$HOME/.local/state/"* ]]; then
+        echo "$item"
+        elif [[ "$item" =~ ^$HOME/\.[^/]+$ ]]; then
+        echo "$item"
+    else
+        if [[ -f "$item" ]]; then
+            echo "$item"
+        fi
+    fi
+done | awk -v app="$APP_BASENAME" -v home="$HOME" '
+{
+    score = 100
+
+    # 清洗应用名称 (去后缀/前缀)，提高匹配率
+    clean_app = tolower(app)
+    sub(/^linux|-bin$|-git$|\.appimage$/, "", clean_app)
+
+    # 提取当前路径的最后一级名称
+    n = split($0, parts, "/")
+    bname = tolower(parts[n])
+
+    # [优先度 1] 名字高度相关 (包含或被包含)
+    if (length(clean_app) > 1 && length(bname) > 1) {
+        if (index(bname, clean_app) > 0 || index(clean_app, bname) > 0) {
+            score -= 50
+        }
+    }
+
+    # [优先度 2] 核心配置目录
+    if (index($0, home "/.config/") == 1 || index($0, home "/.local/share/") == 1) {
+        score -= 30
+    }
+    # [优先度 3] 缓存和状态目录
+    else if (index($0, home "/.cache/") == 1 || index($0, home "/.local/state/") == 1) {
+        score -= 20
+    }
+    # [优先度 4] 根级隐藏目录
+    else if (match($0, "^" home "/\\.[^/]+$")) {
+        score -= 10
+    }
+
+    # 打印分数和路径用于后续数字排序
+    print score "\t" $0
+}' | sort -n -k1,1 | cut -f2- > "$CANDIDATES"
+
+if [[ ! -s "$CANDIDATES" ]]; then
+    echo -e "${C_GREEN}[+] 未发现可以清理的残留目录或文件。${C_RESET}"
+else
+    echo -e "${C_CYAN}[*] 请选择要清理的文件/目录:${C_RESET}"
+    
+    set +e
+    SELECTED=$(cat "$CANDIDATES" | fzf --multi --prompt="按 TAB 多选，回车确认，Ctrl+C/ESC 退出脚本: " --height=40% --layout=reverse)
+    FZF_EXIT_CODE=$?
+    set -e
+    
+    if [[ $FZF_EXIT_CODE -eq 130 ]]; then
+        echo -e "${C_YELLOW}[!] 接收到中断信号 (Ctrl+C/ESC)，已中止并退出。${C_RESET}"
+        exit 0
+        elif [[ $FZF_EXIT_CODE -ne 0 && $FZF_EXIT_CODE -ne 1 ]]; then
+        echo -e "${C_RED}[!] fzf 发生未知错误 (状态码: $FZF_EXIT_CODE)。${C_RESET}"
+        exit 1
+    fi
+    
+    if [[ -n "$SELECTED" ]]; then
+        echo "$SELECTED" | while IFS= read -r f; do
+            rm -rf "$f"
+            echo -e "${C_RED}[-] 已删除: $f${C_RESET}"
+        done
+        echo -e "${C_GREEN}[+] 残留清理完成。${C_RESET}"
+    else
+        echo -e "${C_YELLOW}[*] 未选择任何项目，跳过清理阶段。${C_RESET}"
+    fi
+fi
+
+# --- 卸载软件逻辑 ---
+if [[ "${APP_CMD,,}" == *.appimage ]]; then
+    echo -e -n "${C_YELLOW}是否要删除该 AppImage 文件? [Y/n] ${C_RESET}"
+    read -r ans
+    ans=${ans:-y}
+    if [[ "${ans,,}" == "y" ]]; then
+        rm -f "$APP_CMD"
+        echo -e "${C_RED}[-] 已删除 AppImage: $APP_CMD${C_RESET}"
+    fi
+    exit 0
+fi
+
+echo -e -n "${C_YELLOW}是否要使用包管理器卸载该软件? [Y/n] ${C_RESET}"
+read -r ans
+ans=${ans:-y}
+if [[ "${ans,,}" != "y" ]]; then
+    exit 0
+fi
+
+PKG_MGR=""
+for pm in paru yay pacman; do
+    if command -v "$pm" >/dev/null 2>&1; then
+        PKG_MGR="$pm"
+        break
+    fi
+done
+
+if [[ -z "$PKG_MGR" ]]; then
+    echo -e "${C_RED}[!] 未找到 paru, yay 或 pacman，无法自动卸载。${C_RESET}"
+    exit 1
+fi
+
+PKG_NAME=$(pacman -Qqo "$(which "$APP_CMD" 2>/dev/null)" 2>/dev/null || true)
+
+if [[ -z "$PKG_NAME" ]]; then
+    MATCHES=$( "$PKG_MGR" -Qsq "$APP_CMD" || true )
+    if [[ -z "$MATCHES" ]]; then
+        echo -e "${C_YELLOW}[!] 未在系统中找到名为或包含 '$APP_CMD' 的已安装软件包。${C_RESET}"
+        exit 0
+        elif [[ $(echo "$MATCHES" | wc -l) -eq 1 ]]; then
+        PKG_NAME="$MATCHES"
+    else
+        echo -e "${C_CYAN}[*] 匹配到多个相关的已安装软件包，请选择:${C_RESET}"
+        PKG_NAME=$(echo "$MATCHES" | fzf --prompt="选择要卸载的包，回车确认，ESC 取消: " --height=40% --layout=reverse || true)
+        if [[ -z "$PKG_NAME" ]]; then
+            echo -e "${C_YELLOW}[!] 取消卸载。${C_RESET}"
+            exit 0
+        fi
+    fi
+fi
+
+if [[ -n "$PKG_NAME" ]]; then
+    echo -e "${C_CYAN}[*] 准备卸载软件包: ${C_YELLOW}$PKG_NAME${C_RESET} (使用 $PKG_MGR)"
+    "$PKG_MGR" -Rns "$PKG_NAME"
+fi
