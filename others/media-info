@@ -1,30 +1,21 @@
 #!/bin/bash
 # Description: 显示视频媒体信息
 # ===============================================================
-#   Thunar Media Info v6.3 (Added File Size)
-# ===============================================================
 
-# --- 1. 配置区域 ---
-KITTY_CLASS="thunar_media_info_popup"
-
-# --- 2. 帮助信息 ---
+# --- 1. 帮助信息 ---
 show_help() {
     echo "用法: $(basename "$0") [选项] <文件路径>"
-    echo "  -f <文件>     指定输入文件"
-    echo "  -h            显示帮助"
+    echo "  -f <文件>    指定输入文件"
+    echo "  -h           显示帮助"
 }
 
-# --- 3. 语言检测 ---
+# --- 2. 语言检测与字典 ---
 DETECTED_LANG="${LC_ALL:-${LC_MESSAGES:-$LANG}}"
 [[ "$DETECTED_LANG" == *"zh"* ]] && UI_LANG="zh" || UI_LANG="en"
 
-# --- 4. 本地化字典 (核心修复：使用全角空格对齐) ---
-# 新增: STR_LBL_SIZE | Size | 大　小
 LANG_TABLE='
 STR_ERR_INPUT    | Error: No input file.                | 错误：未检测到输入文件。
 STR_ERR_FFMPEG   | Error: ffmpeg not found.             | 错误：未找到 ffmpeg 命令。
-STR_ERR_KITTY    | Error: Kitty not found.              | 错误：未找到 Kitty 终端。
-STR_WIN_TITLE    | Media Info                           | 媒体信息
 STR_LBL_NAME     |  File    |  文件名
 STR_LBL_PATH     |  Path    |  路　径
 STR_LBL_SIZE     |  Size    |  大　小
@@ -40,7 +31,6 @@ STR_Surround     | Surround                             | 环绕声
 STR_PressKey     | Press any key to close...            | 按任意键关闭窗口...
 '
 
-# 解析字典
 while IFS='|' read -r v e c; do
     v=$(echo "$v" | xargs); e=$(echo "$e" | xargs); c=$(echo "$c" | xargs)
     [ -z "$v" ] && continue
@@ -50,7 +40,7 @@ done <<EOF
 $LANG_TABLE
 EOF
 
-# --- 5. 参数解析 ---
+# --- 3. 参数解析 ---
 FILE=""
 while getopts ":f:h" opt; do
   case $opt in
@@ -60,37 +50,22 @@ while getopts ":f:h" opt; do
   esac
 done
 [ -z "$FILE" ] && shift $((OPTIND-1)) && FILE="$1"
-if [ -z "$FILE" ]; then echo "$STR_ERR_INPUT"; exit 1; fi
+if [ -z "$FILE" ]; then echo "$STR_ERR_INPUT" >&2; exit 1; fi
 
 FILENAME=$(basename -- "$FILE")
 DIRNAME=$(dirname -- "$FILE")
-
-# 获取文件大小 (使用 du -h 获取人类可读格式，cut 取第一列)
 FILESIZE=$(du -h "$FILE" | cut -f1)
 
-if ! command -v ffmpeg &> /dev/null; then echo "$STR_ERR_FFMPEG"; read -n 1; exit 1; fi
-
-# --- 6. Kitty 启动逻辑 ---
-if [ "$TERM" != "xterm-kitty" ] || [ "$KITTY_WINDOW_ID" == "" ]; then
-    if command -v kitty &> /dev/null; then
-        exec kitty --class "$KITTY_CLASS" --title "$STR_WIN_TITLE: $FILENAME" \
-            -o initial_window_width=640 -o initial_window_height=420 -- "$0" "$FILE"
-        exit
-    else
-        echo "$STR_ERR_KITTY"; read -n 1; exit 1
-    fi
-fi
+if ! command -v ffmpeg &> /dev/null; then echo "$STR_ERR_FFMPEG" >&2; exit 1; fi
 
 # =========================================================
-#                    数据渲染
+#                    数据提取与渲染
 # =========================================================
 
 RAW_INFO=$(ffmpeg -i "$FILE" 2>&1)
 BOLD='\033[1m'; GRAY='\033[90m'; CYAN='\033[36m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; RESET='\033[0m'
-clear
 
 # --- 头部 ---
-# 使用 %-9s 配合上面的全角空格，保持完美对齐
 echo ""
 printf " ${CYAN}%-9s${RESET}: ${BOLD}%s${RESET}\n" "$STR_LBL_NAME" "$FILENAME"
 printf " ${CYAN}%-9s${RESET}: %s\n" "$STR_LBL_PATH" "$DIRNAME"
@@ -143,11 +118,12 @@ if [ -n "$AUDIO_STREAMS" ]; then
     done
 fi
 
-# --- 底部 ---
+# --- 底部挂起逻辑 ---
 echo ""
 echo -e "${GRAY}----------------------------------------${RESET}"
 echo -e "${BOLD}$STR_PressKey${RESET}"
 
+# 隐藏光标，读取一个字符，然后恢复光标
 tput civis 
 read -n 1 -s -r
 tput cnorm
