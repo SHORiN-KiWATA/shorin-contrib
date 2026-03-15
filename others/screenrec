@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Description: 屏幕录制
 # ==============================================================================
 # Script Name: shorin-screenrec
 # Description: 终极双引擎 Wayland 录屏管理脚本 (支持 Waybar 与纯 CLI 调用)。
