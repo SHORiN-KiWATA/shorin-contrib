@@ -1,0 +1,916 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Script Name: shorin-screenrec
+# Description: 终极双引擎 Wayland 录屏管理脚本 (支持 Waybar 与纯 CLI 调用)。
+#
+# Architecture (双引擎架构):
+#   - Engine A (wl-screenrec): 高性能，Rust驱动，底层GPU加速。适用物理机。
+#   - Engine B (wf-recorder): 高兼容性，FFmpeg驱动，CPU兜底。适用虚拟机。
+#
+# Features:
+#   1. 纯净 CLI 接口: 支持 -h 帮助，支持命令行参数直达，跳过 GUI 菜单。
+#   2. 动态后端路由: 菜单或命令切换录屏引擎，参数自动隔离。
+#   3. 延迟依赖注入: 仅在触发特定功能时进行检查，绝不阻塞基础功能。
+#   4. 智能音频捕获: 剥离PulseAudio乱码，优雅选择系统声音或麦克风。
+#   5. Waybar 同步: 实时显示时长、引擎状态、JSON 极简输出。
+#
+# Usage: shorin-screenrec -h
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# ================== Runtime state & Persistent Config ==================
+APP_NAME="shorin-screenrec"
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+STATE_DIR="$RUNTIME_DIR/shorin_screenrec"
+
+PIDFILE="$STATE_DIR/pid"
+STARTFILE="$STATE_DIR/start"
+SAVEPATH_FILE="$STATE_DIR/save_path"
+MODEFILE="$STATE_DIR/mode"
+GIF_MARKER="$STATE_DIR/is_gif"
+TICKPIDFILE="$STATE_DIR/tickpid"
+WAYBAR_PIDS_CACHE="$STATE_DIR/waybar.pids"
+CURRENT_ENGINE_FILE="$STATE_DIR/active_engine"
+
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+CONFIG_DIR="$XDG_CACHE_HOME/shorin-screenrec"
+
+CFG_ENGINE="$CONFIG_DIR/engine"
+CFG_CODEC_WL="$CONFIG_DIR/codec_wl"
+CFG_CODEC_WF="$CONFIG_DIR/codec_wf"
+CFG_FPS="$CONFIG_DIR/framerate"
+CFG_AUDIO="$CONFIG_DIR/audio"
+CFG_AUDIO_DEVICE="$CONFIG_DIR/audio_device"
+CFG_DRM="$CONFIG_DIR/drm_device"
+CFG_EXT="$CONFIG_DIR/container_ext"
+
+mkdir -p "$STATE_DIR" "$CONFIG_DIR"
+
+MODE_DECIDED=""
+IS_GIF_MODE="false"
+
+# ================== Tunables (ENV overridable) ==================
+_DEFAULT_ENGINE="wl-screenrec"
+_DEFAULT_CODEC_WL="auto"
+_DEFAULT_CODEC_WF="libx264"
+_DEFAULT_FRAMERATE=""
+_DEFAULT_AUDIO="on"
+_DEFAULT_SAVE_EXT="auto"
+
+GIF_WIDTH=720
+GIF_FPS=30
+GIF_DITHER_MODE="bayer:bayer_scale=5"
+GIF_STATS_MODE="diff"
+
+engine_from_file=$(cat "$CFG_ENGINE" 2>/dev/null || true)
+codec_wl_from_file=$(cat "$CFG_CODEC_WL" 2>/dev/null || true)
+codec_wf_from_file=$(cat "$CFG_CODEC_WF" 2>/dev/null || true)
+fps_from_file=$(cat "$CFG_FPS" 2>/dev/null || true)
+audio_from_file=$(cat "$CFG_AUDIO" 2>/dev/null || true)
+audio_dev_from_file=$(cat "$CFG_AUDIO_DEVICE" 2>/dev/null || true)
+drm_from_file=$(cat "$CFG_DRM" 2>/dev/null || true)
+ext_from_file=$(cat "$CFG_EXT" 2>/dev/null || true)
+
+ENGINE="${ENGINE:-${engine_from_file:-$_DEFAULT_ENGINE}}"
+CODEC_WL="${CODEC_WL:-${codec_wl_from_file:-$_DEFAULT_CODEC_WL}}"
+CODEC_WF="${CODEC_WF:-${codec_wf_from_file:-$_DEFAULT_CODEC_WF}}"
+FRAMERATE="${FRAMERATE:-${fps_from_file:-$_DEFAULT_FRAMERATE}}"
+AUDIO="${AUDIO:-${audio_from_file:-$_DEFAULT_AUDIO}}"
+AUDIO_DEVICE="${AUDIO_DEVICE:-${audio_dev_from_file:-}}"
+DRM_DEVICE="${DRM_DEVICE:-${drm_from_file:-}}"
+SAVE_EXT="${SAVE_EXT:-${ext_from_file:-$_DEFAULT_SAVE_EXT}}"
+
+TITLE="${TITLE:-}"
+SAVE_DIR_ENV="${SAVE_DIR:-}"
+SAVE_SUBDIR_FS="${SAVE_SUBDIR_FS:-fullscreen}"
+OUTPUT="${OUTPUT:-}"
+OUTPUT_SELECT="${OUTPUT_SELECT:-auto}"
+MENU_TITLE_OUTPUT="${MENU_TITLE_OUTPUT:-}"
+MENU_BACKEND="${MENU_BACKEND:-auto}"
+RECORD_MODE="${RECORD_MODE:-ask}"
+REC_AREA="${REC_AREA:-}"
+GEOM_IN_NAME="${GEOM_IN_NAME:-off}"
+WAYBAR_POKE="${WAYBAR_POKE:-on}"
+WAYBAR_SIG="${WAYBAR_SIG:-9}"
+ICON_REC="${ICON_REC:-⏺}"
+ICON_IDLE="${ICON_IDLE:-}"
+PKILL_AFTER_STOP="${PKILL_AFTER_STOP:-on}"
+DEBUG="${DEBUG:-off}"
+
+# ================== Utils & CLI Help ==================
+has() { command -v "$1" >/dev/null 2>&1; }
+
+show_help() {
+  cat <<EOF
+用法: $APP_NAME [命令] [选项]
+
+终极双引擎 Wayland 录屏管理脚本。支持菜单交互与全命令行操作。
+
+命令:
+  start         开始录制 (无选项时将弹出 GUI 菜单)
+  stop          停止当前录制
+  toggle        切换录制状态 (默认行为)
+  status        输出当前状态文本 (用于终端查看)
+  status-json   输出 JSON 格式状态 (专用于 Waybar)
+  settings      打开 GUI 设置菜单
+  help, -h      显示此帮助信息
+
+选项 (用于 start/toggle，指定后将跳过 GUI 菜单):
+  -f, --full    全屏录制
+  -r, --region  区域录制 (使用 slurp 选择)
+  -g, --gif     区域录制并自动转换为 GIF
+  -a, --audio   强制开启音频录制
+  --no-audio    强制关闭音频录制
+  -e, --engine  临时指定录屏引擎 (wl-screenrec 或 wf-recorder)
+
+示例:
+  $APP_NAME start --full --audio
+  $APP_NAME toggle -r -g
+EOF
+}
+
+lang_code() {
+  local l="${LC_MESSAGES:-${LANG:-en}}"
+  l="${l,,}"; l="${l%%.*}"; l="${l%%-*}"; l="${l%%_*}"
+  case "$l" in zh|zh-cn|zh-tw|zh-hk) echo zh ;; ja|jp) echo ja ;; *) echo en ;; esac
+}
+
+msg() {
+  local id="$1"; shift
+  case "$(lang_code)" in
+    zh)
+      case "$id" in
+        err_engine_not_found) printf "错误: 未找到录屏引擎 '%s'" "$@" ;;
+        err_need_slurp)   printf "需要安装 'slurp' 以进行区域选择。" ;;
+        err_need_ffmpeg)  printf "GIF 转换需要 'ffmpeg'，但未找到。" ;;
+        err_need_pactl)   printf "需要 'pactl' (pulseaudio-utils) 以列出音频设备。" ;;
+        cancel_no_mode)   printf "已取消：未选择录制模式。" ;;
+        cancel_no_output) printf "已取消：未选择输出。" ;;
+        cancel_no_region) printf "已取消：未选择区域。" ;;
+        notif_started_full)   printf "开始录制（全屏：%s）\n文件：%s\n\n录制已开启，再次运行脚本结束录制。" "$1" "$2" ;;
+        notif_started_region) printf "开始录制（区域）\n文件：%s\n\n录制已开启，再次运行脚本结束录制。" "$1" ;;
+        notif_saved)    printf "已保存：%s" "$@" ;;
+        notif_stopped)  printf "已停止录制。" ;;
+        notif_processing_gif) printf "正在转换为 GIF，请稍候..." ;;
+        notif_gif_failed)     printf "GIF 转换失败，保留原视频。" ;;
+        notif_copied)         printf "文件 URI 已复制到剪贴板。" ;;
+        already_running) printf "错误: 录制已经在运行中。" ;;
+        not_running)      printf "当前没有正在运行的录制任务。" ;;
+        title_mode)       printf "选择录制模式" ;;
+        title_output)     printf "选择输出显示器" ;;
+        menu_fullscreen) printf "全屏录制" ;;
+        menu_region)     printf "区域录制" ;;
+        menu_gif_region) printf "录制 GIF (区域)" ;;
+        title_settings)  printf "设置..." ;;
+        menu_settings)   printf "设置..." ;;
+        menu_set_engine) printf "引擎：%s" "$@" ;;
+        menu_set_codec)  printf "编码格式：%s" "$@" ;;
+        menu_set_fps)    printf "最高帧率：%s" "$@" ;;
+        menu_set_filefmt) printf "文件格式：%s" "$@" ;;
+        menu_toggle_audio) printf "音频：%s" "$@" ;;
+        menu_set_audio_dev) printf "音频设备：%s" "$@" ;;
+        title_audio_dev)  printf "选择音频源" ;;
+        audio_dev_default) printf "自动" ;;
+        menu_set_render) printf "渲染设备：%s" "$@" ;;
+        menu_back)        printf "返回" ;;
+        fps_unlimited)    printf "不限制" ;;
+        render_auto)      printf "自动" ;;
+        ext_auto)         printf "自动" ;;
+        title_select_engine) printf "选择录屏后端引擎" ;;
+        title_select_codec) printf "选择编码格式" ;;
+        title_select_fps)     printf "选择最高帧率" ;;
+        title_select_filefmt) printf "选择文件格式" ;;
+        title_select_render) printf "选择渲染设备（/dev/dri/renderD*）" ;;
+        mode_full)        printf "全屏" ;;
+        mode_region)      printf "区域" ;;
+        prompt_enter_number) printf "输入编号：" ;;
+        menu_exit)        printf "退出" ;;
+        *) printf "%s" "$id" ;;
+      esac
+      ;;
+    *)
+      case "$id" in
+        err_engine_not_found) printf "Error: Backend engine '%s' not found" "$@" ;;
+        err_need_slurp)   printf "Error: 'slurp' required for region selection." ;;
+        err_need_ffmpeg)  printf "Error: 'ffmpeg' required for GIF conversion." ;;
+        err_need_pactl)   printf "Error: 'pactl' required to list audio devices." ;;
+        cancel_no_mode)   printf "Canceled: no recording mode selected." ;;
+        cancel_no_output) printf "Canceled: no output selected." ;;
+        cancel_no_region) printf "Canceled: no region selected." ;;
+        notif_started_full)   printf "Recording started (Fullscreen: %s)\nFile: %s\n\nRecording started. Run script again to stop." "$1" "$2" ;;
+        notif_started_region) printf "Recording started (Region)\nFile: %s\n\nRecording started. Run script again to stop." "$1" ;;
+        notif_saved)    printf "Saved: %s" "$@" ;;
+        notif_stopped)  printf "Recording stopped." ;;
+        notif_processing_gif) printf "Converting to GIF, please wait..." ;;
+        notif_gif_failed)     printf "GIF conversion failed. Original video kept." ;;
+        notif_copied)         printf "File URI copied to clipboard." ;;
+        already_running) printf "already running" ;;
+        not_running)      printf "not running" ;;
+        title_mode)       printf "Select recording mode" ;;
+        title_output)     printf "Select output monitor" ;;
+        menu_fullscreen) printf "Fullscreen" ;;
+        menu_region)     printf "Region" ;;
+        menu_gif_region) printf "Record GIF (Region)" ;;
+        title_settings)  printf "Settings..." ;;
+        menu_settings)   printf "Settings..." ;;
+        menu_set_engine) printf "Engine: %s" "$@" ;;
+        menu_set_codec)  printf "Codec: %s" "$@" ;;
+        menu_set_fps)    printf "Max Framerate: %s" "$@" ;;
+        menu_set_filefmt) printf "File Format: %s" "$@" ;;
+        menu_toggle_audio) printf "Audio: %s" "$@" ;;
+        menu_set_audio_dev) printf "Audio Device: %s" "$@" ;;
+        title_audio_dev)  printf "Select Audio Source" ;;
+        audio_dev_default) printf "Auto" ;;
+        menu_set_render) printf "Render Device: %s" "$@" ;;
+        menu_back)        printf "Back" ;;
+        fps_unlimited)    printf "unlimited" ;;
+        render_auto)      printf "Auto" ;;
+        ext_auto)         printf "Auto" ;;
+        title_select_engine) printf "Select Backend Engine" ;;
+        title_select_codec) printf "Select Codec" ;;
+        title_select_fps)     printf "Select Max Framerate" ;;
+        title_select_filefmt) printf "Select File Format" ;;
+        title_select_render) printf "Select Render Device (/dev/dri/renderD*)" ;;
+        mode_full)        printf "Fullscreen" ;;
+        mode_region)      printf "Region" ;;
+        prompt_enter_number) printf "Enter number: " ;;
+        menu_exit)        printf "Exit" ;;
+        *) printf "%s" "$id" ;;
+      esac
+      ;;
+  esac
+}
+
+is_running() {
+  [[ -r "$PIDFILE" ]] || return 1
+  local pid; read -r pid <"$PIDFILE" 2>/dev/null || return 1
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+notify() { has notify-send && notify-send "$APP_NAME" "$1" || true; }
+echo_terminal() { printf "%b\n" "$1"; } # 输出到终端，正确解析 \n
+
+signal_waybar() {
+  local pids
+  if [[ -r "$WAYBAR_PIDS_CACHE" ]]; then
+    pids="$(tr '\n' ' ' <"$WAYBAR_PIDS_CACHE")"
+    if [[ -n "$pids" ]]; then kill -RTMIN+"$WAYBAR_SIG" $pids 2>/dev/null && return 0; fi
+  fi
+  pids="$(pgrep -x -u "$UID" waybar 2>/dev/null | tr '\n' ' ')"
+  [[ -n "$pids" ]] && printf '%s\n' $pids >"$WAYBAR_PIDS_CACHE"
+  [[ -n "$pids" ]] && kill -RTMIN+"$WAYBAR_SIG" $pids 2>/dev/null || true
+}
+emit_waybar_signal() { [[ "${WAYBAR_POKE,,}" == "off" ]] && return 0; signal_waybar; }
+
+start_tick() {
+  if [[ -f "$TICKPIDFILE" ]]; then
+    local tpid; read -r tpid <"$TICKPIDFILE" 2>/dev/null || true
+    [[ -n "$tpid" ]] && kill -TERM "$tpid" 2>/dev/null || true
+    rm -f "$TICKPIDFILE"
+  fi
+  (
+    while :; do
+      [[ -r "$PIDFILE" ]] || break
+      local p; read -r p <"$PIDFILE" 2>/dev/null || p=""
+      [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null || break
+      signal_waybar
+      sleep 1
+    done
+  ) & echo $! >"$TICKPIDFILE"
+}
+stop_tick() {
+  if [[ -f "$TICKPIDFILE" ]]; then
+    local tpid; read -r tpid <"$TICKPIDFILE" 2>/dev/null || true
+    [[ -n "$tpid" ]] && kill -TERM "$tpid" 2>/dev/null || true
+    rm -f "$TICKPIDFILE"
+  fi
+}
+
+get_save_dir() {
+  local videos
+  if has xdg-user-dir; then videos="$(xdg-user-dir VIDEOS 2>/dev/null || true)"; fi
+  videos="${videos:-"$HOME/Videos"}"
+  echo "${SAVE_DIR_ENV:-"$videos/$APP_NAME"}"
+}
+
+list_render_nodes() {
+  local d
+  for d in /dev/dri/renderD*; do
+    [[ -r "$d" ]] && printf '%s\n' "$d"
+  done 2>/dev/null || true
+}
+render_display() {
+  local cur="${1:-}"
+  if [[ -z "$cur" ]]; then msg render_auto; else printf "%s" "$cur"; fi
+}
+pick_render_device() {
+  local dev="${DRM_DEVICE:-}"
+  if [[ -n "$dev" && ! -r "$dev" ]]; then dev=""; fi
+  echo -n "$dev"
+}
+
+ext_for_codec(){
+  local test_codec="$1"
+  case "${test_codec,,}" in
+    *h264*|*hevc*|avc) echo mp4 ;;
+    *vp8*|*vp9*) echo webm ;;
+    *av1*) echo mkv ;;
+    *) echo mp4 ;;
+  esac
+}
+choose_ext(){
+  local e="${SAVE_EXT,,}"
+  if [[ -z "$e" || "$e" == "auto" ]]; then
+    if [[ "$ENGINE" == "wl-screenrec" ]]; then ext_for_codec "$CODEC_WL"
+    else ext_for_codec "$CODEC_WF"; fi
+  else
+    case "$e" in mp4|mkv|webm) echo "$e" ;; *) echo mp4 ;; esac
+  fi
+}
+
+# ================== Menus ==================
+__norm() { printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+_pick_menu_backend() {
+  local pref="${MENU_BACKEND,,}"
+  case "$pref" in fuzzel|wofi|rofi|bemenu|fzf|term) : ;; auto|"") pref="auto" ;; *) pref="auto" ;; esac
+  
+  # 如果用户在环境变量中强行指定了某一个后端，绝对尊重用户的选择
+  if [[ "$pref" != "auto" ]]; then
+    if has "$pref"; then echo "$pref"; else [[ -t 0 ]] && echo "term" || echo "none"; fi
+    return
+  fi
+
+  # [智能上下文探测 Context-Aware Detection]
+  if [[ -t 0 ]]; then
+    # 1. 终端环境 (TTY)：如果装了 fzf 则使用极客最爱的 fzf，否则使用最纯粹的数字问答 (term)
+    if has fzf; then 
+      echo "fzf"
+    else 
+      echo "term"
+    fi
+  else
+    # 2. GUI 环境 (Waybar/快捷键后台唤醒)：按优先级寻找图形化桌面启动器
+    for b in fuzzel wofi rofi bemenu; do 
+      has "$b" && { echo "$b"; return; }
+    done
+    echo "none"
+  fi
+}
+
+menu_pick() {
+  local title="${1:-Select}"; shift
+  local items=("$@")
+  ((${#items[@]})) || return 130
+
+  local backend; backend="$(_pick_menu_backend)"
+  local sel rc=130
+  case "$backend" in
+    fuzzel) set +e; sel="$(printf '%s\n' "${items[@]}" | fuzzel --dmenu -p "$title")"; rc=$?; set -e ;;
+    wofi)   set +e; sel="$(printf '%s\n' "${items[@]}" | wofi --dmenu --prompt "$title")"; rc=$?; set -e ;;
+    rofi)   set +e; sel="$(printf '%s\n' "${items[@]}" | rofi -dmenu -p "$title")"; rc=$?; set -e ;;
+    bemenu) set +e; sel="$(printf '%s\n' "${items[@]}" | bemenu -p "$title")"; rc=$?; set -e ;;
+    fzf)    
+      set +e
+      # [TUI 优化]: 不全屏 (50%高度)、正常自上而下排序 (reverse)、带有边框 (border)
+      sel="$(printf '%s\n' "${items[@]}" | fzf --prompt "$title > " --layout=reverse --height=50% --border)"
+      rc=$?
+      set -e 
+      ;;
+    term)
+      echo "$title"
+      local i=1; for it in "${items[@]}"; do printf '  %d) %s\n' "$i" "$it"; ((i++)); done
+      printf "%s" "$(msg prompt_enter_number)"
+      local idx; set +e; read -r idx; rc=$?; set -e
+      if [[ $rc -eq 0 && -n "$idx" && "$idx" =~ ^[0-9]+$ ]]; then
+        if (( idx>=1 && idx<=${#items[@]} )); then sel="${items[$((idx-1))]}"; rc=0; fi
+      fi
+      ;;
+    none) return 130 ;;
+  esac
+  [[ $rc -ne 0 || -z "${sel:-}" ]] && return 130
+  printf '%s' "$(__norm "$sel")"
+}
+
+# ---------- Outputs ----------
+list_outputs() {
+  local raw=""
+  if has niri; then
+    raw="$(niri msg outputs 2>/dev/null | awk -F '[()]' '/^Output/ {print $2}')"
+  elif has hyprctl && has jq; then
+    raw="$(hyprctl monitors -j 2>/dev/null | jq -r '.[].name')"
+  elif has swaymsg && has jq; then
+    raw="$(swaymsg -t get_outputs 2>/dev/null | jq -r '.[].name')"
+  elif has wlr-randr; then
+    raw="$(wlr-randr 2>/dev/null | awk '/^[^ ]/{print $1}')"
+  fi
+  if [[ -n "$raw" ]]; then awk 'NF>0 {print $1}' <<< "$raw" | sort -u || true; fi
+}
+
+decide_output() {
+  if [[ -n "$OUTPUT" ]]; then printf '%s' "$OUTPUT"; return 0; fi
+  local -a outs; mapfile -t outs < <(list_outputs || true)
+  if ((${#outs[@]} == 0)); then printf ""; return 0; fi
+
+  local out_title; out_title="${MENU_TITLE_OUTPUT:-$(msg title_output)}"
+  if [[ "${OUTPUT_SELECT}" == "menu" ]] || { [[ "${OUTPUT_SELECT}" == "auto" ]] && ((${#outs[@]} > 1)); }; then
+    local pick; pick="$(menu_pick "$out_title" "${outs[@]}")" || return 130
+    printf '%s' "$pick"
+    return 0
+  fi
+  printf '%s' "${outs[0]}"
+  return 0
+}
+
+# ---------- Settings ----------
+choose_audio_device_menu() {
+  if ! has pactl; then
+    notify "$(msg err_need_pactl)"
+    return 0
+  fi
+  
+  local -a display_names=()
+  local -a internal_names=()
+  
+  while IFS='|' read -r raw_name raw_desc; do
+    internal_names+=("$raw_name")
+    display_names+=("$raw_desc")
+  done < <(
+    LC_ALL=C pactl list sources 2>/dev/null | awk '
+      /^[ \t]*Name:/ { name=$2 }
+      /^[ \t]*Description:/ {
+        sub(/^[ \t]*Description:[ \t]*/, ""); desc=$0;
+        sub(/^Monitor of /, "", desc);
+        if (name ~ /\.monitor$/) type="[系统]"
+        else type="[麦克]"
+        printf "%s|%s %s\n", name, type, desc
+      }
+    ' | sort -t '|' -k 2 -r
+  )
+  
+  local auto_item="$(msg audio_dev_default)"
+  local pick
+  if ! pick="$(menu_pick "$(msg title_audio_dev)" "$auto_item" "${display_names[@]}")"; then return 0; fi
+  
+  if [[ "$pick" == "$auto_item" ]]; then
+    AUDIO_DEVICE=""
+    rm -f "$CFG_AUDIO_DEVICE"
+  else
+    for i in "${!display_names[@]}"; do
+      if [[ "${display_names[$i]}" == "$pick" ]]; then
+        AUDIO_DEVICE="${internal_names[$i]}"
+        printf '%s' "$AUDIO_DEVICE" >"$CFG_AUDIO_DEVICE"
+        break
+      fi
+    done
+  fi
+}
+
+choose_render_menu() {
+  local -a nodes; mapfile -t nodes < <(list_render_nodes | sort -V || true)
+  local auto_item="$(msg render_auto)"
+  local pick; if ! pick="$(menu_pick "$(msg title_select_render)" "$auto_item" "${nodes[@]}")"; then return 0; fi
+  if [[ "$pick" == "$auto_item" ]]; then
+    DRM_DEVICE=""; rm -f "$CFG_DRM"
+  else
+    DRM_DEVICE="$pick"; printf '%s' "$DRM_DEVICE" >"$CFG_DRM"
+  fi
+}
+
+choose_filefmt_menu() {
+  local auto_item="$(msg ext_auto)"
+  local pick; if ! pick="$(menu_pick "$(msg title_select_filefmt)" "$auto_item" "mp4" "mkv" "webm")"; then return 0; fi
+  if [[ "$pick" == "$auto_item" ]]; then
+    SAVE_EXT="auto"; rm -f "$CFG_EXT"
+  else
+    SAVE_EXT="$pick"; printf '%s' "$SAVE_EXT" >"$CFG_EXT"
+  fi
+}
+
+show_settings_menu() {
+  while :; do
+    local fps_display="${FRAMERATE:-$(msg fps_unlimited)}"
+    local audio_display="${AUDIO}"
+    
+    local ad_display="${AUDIO_DEVICE:-$(msg audio_dev_default)}"
+    if [[ "$ad_display" != "$(msg audio_dev_default)" ]] && ((${#ad_display} > 30)); then
+      ad_display="${ad_display:0:12}...${ad_display: -12}"
+    fi
+    
+    local render_display_now="$(render_display "$DRM_DEVICE")"
+    local ff_display; if [[ -z "$SAVE_EXT" || "${SAVE_EXT,,}" == "auto" ]]; then ff_display="$(msg ext_auto)"; else ff_display="$SAVE_EXT"; fi
+
+    local current_codec; [[ "$ENGINE" == "wl-screenrec" ]] && current_codec="$CODEC_WL" || current_codec="$CODEC_WF"
+
+    local pick; pick="$(menu_pick "$(msg title_settings)" \
+                      "$(msg menu_set_engine "$ENGINE")" \
+                      "$(msg menu_set_fps "$fps_display")" \
+                      "$(msg menu_toggle_audio "$audio_display")" \
+                      "$(msg menu_set_audio_dev "$ad_display")" \
+                      "$(msg menu_set_codec "$current_codec")" \
+                      "$(msg menu_set_filefmt "$ff_display")" \
+                      "$(msg menu_set_render "$render_display_now")" \
+                      "$(msg menu_back)")" || return 0
+
+    if [[ "$pick" == "$(msg menu_set_engine "$ENGINE")" ]]; then
+      local new_eng="$(menu_pick "$(msg title_select_engine)" "wl-screenrec" "wf-recorder")" || continue
+      ENGINE="$new_eng"; printf '%s' "$ENGINE" >"$CFG_ENGINE"
+
+    elif [[ "$pick" == "$(msg menu_set_fps "$fps_display")" ]]; then
+      local newf; newf="$(menu_pick "$(msg title_select_fps)" "60" "30" "120" "144" "165" "240" "$(msg fps_unlimited)")" || continue
+      if [[ "$newf" == "$(msg fps_unlimited)" ]]; then
+        FRAMERATE=""; rm -f "$CFG_FPS"
+      elif [[ "$newf" =~ ^[0-9]+$ && "$newf" -gt 0 ]]; then 
+        FRAMERATE="$newf"; printf '%s' "$FRAMERATE" >"$CFG_FPS"
+      fi
+
+    elif [[ "$pick" == "$(msg menu_toggle_audio "$audio_display")" ]]; then
+      if [[ "$AUDIO" == "on" ]]; then AUDIO="off"; else AUDIO="on"; fi
+      printf '%s' "$AUDIO" >"$CFG_AUDIO"
+
+    elif [[ "$pick" == "$(msg menu_set_audio_dev "$ad_display")" ]]; then
+      choose_audio_device_menu
+
+    elif [[ "$pick" == "$(msg menu_set_codec "$current_codec")" ]]; then
+      if [[ "$ENGINE" == "wl-screenrec" ]]; then
+        local newc="$(menu_pick "$(msg title_select_codec)" "auto" "avc" "hevc" "av1" "vp8" "vp9")" || continue
+        CODEC_WL="$newc"; printf '%s' "$CODEC_WL" >"$CFG_CODEC_WL"
+      else
+        local newc="$(menu_pick "$(msg title_select_codec)" "libx264" "h264_vaapi" "hevc_vaapi" "av1_vaapi" "vp9_vaapi")" || continue
+        CODEC_WF="$newc"; printf '%s' "$CODEC_WF" >"$CFG_CODEC_WF"
+      fi
+
+    elif [[ "$pick" == "$(msg menu_set_filefmt "$ff_display")" ]]; then
+      choose_filefmt_menu
+
+    elif [[ "$pick" == "$(msg menu_set_render "$render_display_now")" ]]; then
+      choose_render_menu
+
+    elif [[ "$pick" == "$(msg menu_back)" ]]; then
+      return 0
+    fi
+  done
+}
+
+# ---------- Mode selection ----------
+decide_mode() {
+  case "${RECORD_MODE,,}" in
+    full|fullscreen) MODE_DECIDED="full";    return 0 ;;
+    region|area)     MODE_DECIDED="region"; return 0 ;;
+  esac
+  
+  local L_FULL="$(msg menu_fullscreen)"
+  local L_REGION="$(msg menu_region)"
+  local L_GIF="$(msg menu_gif_region)"
+  local L_SETTINGS="$(msg menu_settings)"
+  local L_EXIT="$(msg menu_exit)"
+  
+  while :; do
+    local pick; pick="$(menu_pick "$(msg title_mode)" "$L_FULL" "$L_REGION" "$L_GIF" "$L_SETTINGS" "$L_EXIT")" || return 130
+    if   [[ "$pick" == "$L_FULL"    ]]; then MODE_DECIDED="full";    return 0
+    elif [[ "$pick" == "$L_REGION"  ]]; then MODE_DECIDED="region"; return 0
+    elif [[ "$pick" == "$L_GIF"     ]]; then MODE_DECIDED="region"; IS_GIF_MODE="true"; return 0
+    elif [[ "$pick" == "$L_SETTINGS" ]]; then show_settings_menu; continue
+    elif [[ "$pick" == "$L_EXIT"    ]]; then return 130
+    else return 130; fi
+  done
+}
+
+# ---------- Helpers ----------
+geom_token() {
+  local g="$1"
+  awk 'NF==2{split($1,a,","); split($2,b,"x");
+             if(a[1]!=""){printf "%sx%s@%s,%s",b[1],b[2],a[1],a[2]}}' <<<"$g"
+}
+pretty_dur() {
+  local dur="${1:-0}"
+  [[ "$dur" =~ ^[0-9]+$ ]] || dur=0
+  if ((dur>=3600)); then printf "%d:%02d:%02d" $((dur/3600)) $(((dur%3600)/60)) $((dur%60))
+  else printf "%02d:%02d" $((dur/60)) $((dur%60)); fi
+}
+json_escape() { sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g'; }
+
+# ================== Start / Stop ==================
+start_rec() {
+  if is_running; then 
+    local msg="$(msg already_running)"
+    echo_terminal "$msg"; notify "$msg"; exit 0
+  fi
+  
+  has "$ENGINE" || { 
+    local msg="$(msg err_engine_not_found "$ENGINE")"
+    echo_terminal "$msg"; notify "$msg"; exit 1 
+  }
+
+  MODE_DECIDED=""
+  if ! decide_mode; then
+    echo_terminal "$(msg cancel_no_mode)"; emit_waybar_signal; exit 130
+  fi
+  local mode="$MODE_DECIDED"
+
+  if [[ "$IS_GIF_MODE" == "true" ]]; then
+      has ffmpeg || { local msg="$(msg err_need_ffmpeg)"; echo_terminal "$msg"; notify "$msg"; emit_waybar_signal; exit 1; }
+      SAVE_EXT="mp4"
+      touch "$GIF_MARKER"
+  else
+      rm -f "$GIF_MARKER"
+  fi
+
+  local marker="" output="" GEOM="" gtok=""
+  local -a args=()
+
+  local ROOT_DIR="$(get_save_dir)"
+  local TARGET_DIR
+  if [[ "$mode" == "full" ]]; then TARGET_DIR="$ROOT_DIR/${SAVE_SUBDIR_FS}"; else TARGET_DIR="$ROOT_DIR"; fi
+  mkdir -p "$TARGET_DIR"
+
+  if [[ "$mode" == "full" ]]; then
+    output="$(decide_output)"
+    marker="FS${output:+-$output}"
+  else
+    if [[ -n "$REC_AREA" ]]; then
+      GEOM="$REC_AREA"
+    else
+      has slurp || { local msg="$(msg err_need_slurp)"; echo_terminal "$msg"; notify "$msg"; emit_waybar_signal; exit 1; }
+      set +e; GEOM="$(slurp)"; local rc=$?; set -e
+      if [[ $rc -ne 0 || -z "${GEOM// /}" ]]; then echo_terminal "$(msg cancel_no_region)"; emit_waybar_signal; exit 130; fi
+    fi
+    GEOM="$(echo -n "$GEOM" | tr -s '[:space:]' ' ')"
+    if [[ "${GEOM_IN_NAME,,}" == "on" ]]; then gtok="$(geom_token "$GEOM")"; marker="REGION${gtok:+-$gtok}"; else marker="REGION"; fi
+  fi
+
+  local ts="$(date +'%Y-%m-%d-%H%M%S')"; local safe_title="${TITLE// /_}"
+  local base="$ts${safe_title:+-$safe_title}-${marker}"
+  local ext="$(choose_ext)"
+  local SAVE_PATH="$TARGET_DIR/$base.$ext"
+
+  local dev="$(pick_render_device)"
+
+  case "$ENGINE" in
+    wl-screenrec)
+      [[ -n "$output" ]] && args+=( -o "$output" )
+      [[ -n "$GEOM" ]]   && args+=( -g "$GEOM" )
+      args+=( -f "$SAVE_PATH" )
+      [[ -n "$dev" ]] && args+=( --dri-device "$dev" )
+      [[ "$CODEC_WL" != "auto" ]] && args+=( --codec "$CODEC_WL" )
+
+      if [[ "$AUDIO" == "on" ]]; then 
+        args+=( --audio )
+        [[ -n "$AUDIO_DEVICE" ]] && args+=( --audio-device "$AUDIO_DEVICE" )
+      fi
+
+      if [[ -n "$FRAMERATE" ]]; then
+        if [[ "$FRAMERATE" =~ ^[0-9]+$ && "$FRAMERATE" -gt 0 ]]; then args+=( -m "$FRAMERATE" )
+        else echo_terminal "$(msg warn_invalid_fps "$FRAMERATE")" >&2; fi
+      fi
+      ;;
+      
+    wf-recorder)
+      [[ -n "$output" ]] && args+=( -o "$output" )
+      [[ -n "$GEOM" ]]   && args+=( -g "$GEOM" )
+      args+=( --file "$SAVE_PATH" -c "$CODEC_WF" )
+      [[ -n "$dev" ]] && args+=( -d "$dev" )
+
+      if [[ "$AUDIO" == "on" ]]; then 
+        if [[ -n "$AUDIO_DEVICE" ]]; then 
+          args+=( "--audio=$AUDIO_DEVICE" )
+        else 
+          args+=( "-a" )
+        fi
+      fi
+
+      if [[ -n "$FRAMERATE" ]]; then
+        if [[ "$FRAMERATE" =~ ^[0-9]+$ && "$FRAMERATE" -gt 0 ]]; then args+=( --framerate "$FRAMERATE" )
+        else echo_terminal "$(msg warn_invalid_fps "$FRAMERATE")" >&2; fi
+      fi
+
+      if [[ "$CODEC_WF" == *"_vaapi" ]]; then args+=( -F "scale_vaapi=format=nv12:out_range=full:out_color_primaries=bt709" )
+      else args+=( -F "format=yuv420p" ); fi
+      ;;
+  esac
+
+  setsid nohup "$ENGINE" "${args[@]}" >/dev/null 2>&1 &
+  local pid=$!
+  echo "$pid" >"$PIDFILE"
+  date +%s >"$STARTFILE"
+  echo "$SAVE_PATH" >"$SAVEPATH_FILE"
+  echo "$mode" >"$MODEFILE"
+  echo "$ENGINE" >"$CURRENT_ENGINE_FILE"
+
+  local note; if [[ "$mode" == "full" ]]; then note="$(msg notif_started_full "${output:-Default}" "$SAVE_PATH")"; else note="$(msg notif_started_region "$SAVE_PATH")"; fi
+  
+  # 在终端显示启动信息并触发桌面通知
+  echo_terminal "\n=============================="
+  echo_terminal "$note"
+  echo_terminal "==============================\n"
+  notify "$note"
+  
+  emit_waybar_signal
+  start_tick
+}
+
+stop_rec() {
+  if ! is_running; then 
+    local msg="$(msg not_running)"
+    echo_terminal "$msg"; notify "$msg"; emit_waybar_signal; exit 0
+  fi
+  
+  local pid; read -r pid <"$PIDFILE"
+  local active_engine="$ENGINE"; [[ -r "$CURRENT_ENGINE_FILE" ]] && read -r active_engine <"$CURRENT_ENGINE_FILE"
+
+  kill -INT "$pid" 2>/dev/null || true
+  for _ in {1..40}; do sleep 0.1; is_running || break; done
+  is_running && kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.2
+  is_running && kill -KILL "$pid" 2>/dev/null || true
+
+  rm -f "$PIDFILE" "$MODEFILE" "$CURRENT_ENGINE_FILE"
+  stop_tick
+
+  local save_path=""; [[ -r "$SAVEPATH_FILE" ]] && read -r save_path <"$SAVEPATH_FILE"
+  
+  if [[ -f "$GIF_MARKER" ]]; then
+    rm -f "$GIF_MARKER"
+    if [[ -n "$save_path" && -f "$save_path" ]]; then
+        local msg="$(msg notif_processing_gif)"
+        echo_terminal "$msg"; notify "$msg"
+        
+        local gif_dir="$(get_save_dir)/gif"
+        mkdir -p "$gif_dir"
+        local filename=$(basename "$save_path")
+        local gif_out="$gif_dir/${filename%.*}.gif"
+        local filters="fps=$GIF_FPS,scale=$GIF_WIDTH:-1:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=$GIF_STATS_MODE[p];[s1][p]paletteuse=dither=$GIF_DITHER_MODE"
+        
+        if ffmpeg -y -v error -i "$save_path" -vf "$filters" "$gif_out"; then
+             rm "$save_path"
+             save_path="$gif_out"
+             echo "$save_path" > "$SAVEPATH_FILE"
+        else
+             local err_msg="$(msg notif_gif_failed)"
+             echo_terminal "$err_msg"; notify "$err_msg"
+        fi
+    fi
+  fi
+
+  if [[ -n "$save_path" && -f "$save_path" ]]; then
+    ln -sf "$(basename "$save_path")" "$(dirname "$save_path")/latest" || true
+
+    local cp_note=""
+    if has wl-copy; then
+        echo "file://${save_path}" | wl-copy --type text/uri-list
+        cp_note="\n$(msg notif_copied)"
+    fi
+
+    local s="$(msg notif_saved "$save_path")${cp_note}"
+    echo_terminal "\n=============================="
+    echo_terminal "$s"
+    echo_terminal "==============================\n"
+    notify "$s"
+  else
+    local msg="$(msg notif_stopped)"
+    echo_terminal "$msg"; notify "$msg"
+  fi
+
+  if [[ "${PKILL_AFTER_STOP,,}" != "off" ]]; then
+    for sig in INT TERM KILL; do
+      pgrep -x -u "$UID" "$active_engine" >/dev/null || break
+      pkill -"$sig" -x -u "$UID" "$active_engine" 2>/dev/null || true
+      sleep 0.1
+    done
+  fi
+  emit_waybar_signal
+}
+
+# ================== Waybar JSON/status ==================
+tooltip_idle_text() {
+  case "$(lang_code)" in
+    zh) cat <<EOF
+屏幕录制 ($ENGINE)
+左键：打开录制菜单
+右键：强制关闭
+EOF
+      ;;
+    *)  cat <<EOF
+Screen recording ($ENGINE)
+Left click: open recording menu
+Right click: force stop
+EOF
+      ;;
+  esac
+}
+tooltip_recording_text() {
+  local t="$1" p="${2:-}" m="${3:-}"
+  local mode_label
+  case "$m" in full|fullscreen) mode_label="$(msg mode_full)";; region|area) mode_label="$(msg mode_region)";; *) mode_label="";; esac
+  case "$(lang_code)" in
+    zh) [[ -n "$p" ]] && { [[ -n "$mode_label" ]] && printf "录制中（%s - %s）\n已用时：%s\n文件：%s\n" "$mode_label" "$ENGINE" "$t" "$p" || printf "录制中 (%s)\n已用时：%s\n文件：%s\n" "$ENGINE" "$t" "$p"; } || { [[ -n "$mode_label" ]] && printf "录制中（%s - %s）\n已用时：%s\n" "$mode_label" "$ENGINE" "$t" || printf "录制中 (%s)\n已用时：%s\n" "$ENGINE" "$t"; } ;;
+    *)  [[ -n "$p" ]] && { [[ -n "$mode_label" ]] && printf "Recording (%s - %s)\nElapsed: %s\nFile: %s\n" "$mode_label" "$ENGINE" "$t" "$p" || printf "Recording (%s)\nElapsed: %s\nFile: %s\n" "$ENGINE" "$t" "$p"; } || { [[ -n "$mode_label" ]] && printf "Recording (%s - %s)\nElapsed: %s\n" "$mode_label" "$ENGINE" "$t" || printf "Recording (%s)\nElapsed: %s\n" "$ENGINE" "$t"; } ;;
+  esac
+}
+pretty_status_json() {
+  local text tooltip class alt
+  if is_running; then
+    local start=0; [[ -r "$STARTFILE" ]] && read -r start <"$STARTFILE" || true
+    [[ "$start" =~ ^[0-9]+$ ]] || start=0
+    local now dur; now="$(date +%s)"; dur=$((now - start)); (( dur < 0 )) && dur=0
+    local t="$(pretty_dur "$dur")"
+    local save_path=""; [[ -r "$SAVEPATH_FILE" ]] && read -r save_path <"$SAVEPATH_FILE" || true
+    local mode=""; [[ -r "$MODEFILE" ]] && read -r mode <"$MODEFILE" || true
+    text="$ICON_REC$t"
+    tooltip="$(tooltip_recording_text "$t" "$save_path" "$mode")"
+    class="recording"; alt="rec"
+  else
+    text="$ICON_IDLE"; tooltip="$(tooltip_idle_text)"; class="idle"; alt="idle"
+  fi
+  printf '{"text":"%s","tooltip":"%s","class":"%s","alt":"%s"}\n' \
+      "$(printf '%s' "$text"    | json_escape)" \
+      "$(printf '%s' "$tooltip" | json_escape)" \
+     "$class" "$alt"
+}
+status_rec() {
+  local json="${1:-}"
+  if [[ "$json" == "--json" ]]; then
+    pretty_status_json
+  else
+    if is_running; then
+      local start=0; [[ -r "$STARTFILE" ]] && read -r start <"$STARTFILE" || true
+      [[ "$start" =~ ^[0-9]+$ ]] || start=0
+      local now dur; now="$(date +%s)"; dur=$((now - start)); (( dur < 0 )) && dur=0
+      printf "%s%s\n" "$ICON_REC" "$(pretty_dur "$dur")"
+    else
+      echo "$ICON_IDLE"
+    fi
+  fi
+}
+
+# ================== CLI Argument Parsing & Main ==================
+
+COMMAND="toggle"
+
+# 1. 提取主命令
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    start|stop|toggle|status|status-json|waybar|is-active|settings)
+      COMMAND="$1"
+      shift
+      ;;
+    -h|--help|help)
+      show_help
+      exit 0
+      ;;
+    -*)
+      # 用户直接输入了带有横杠的选项，隐式默认命令为 'toggle'
+      COMMAND="toggle"
+      ;;
+    *)
+      echo_terminal "未知命令: $1"
+      show_help
+      exit 1
+      ;;
+  esac
+fi
+
+# 2. 提取快捷选项 (允许命令行直达，跳过 UI 菜单)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help|help)
+      show_help; exit 0 ;;
+    -f|--full|--fullscreen)
+      RECORD_MODE="full" ;;
+    -r|--region)
+      RECORD_MODE="region" ;;
+    -g|--gif)
+      RECORD_MODE="region"
+      IS_GIF_MODE="true" ;;
+    -a|--audio)
+      AUDIO="on" ;;
+    --no-audio)
+      AUDIO="off" ;;
+    -e|--engine)
+      shift
+      if [[ -n "${1:-}" ]]; then 
+        ENGINE="$1"
+      else 
+        echo_terminal "错误: --engine 选项缺少参数 (wl-screenrec 或 wf-recorder)"
+        exit 1
+      fi
+      ;;
+    *)
+      echo_terminal "未知参数: $1"
+      show_help; exit 1 ;;
+  esac
+  shift
+done
+
+# 3. 执行分发
+case "$COMMAND" in
+  start)          start_rec ;;
+  stop)           stop_rec ;;
+  status)         status_rec ;;
+  status-json)    status_rec --json ;;
+  waybar)         status_rec --json ;;
+  is-active)      if is_running; then exit 0; else exit 1; fi ;;
+  toggle)         is_running && stop_rec || start_rec ;;
+  settings)       show_settings_menu ;;
+esac
