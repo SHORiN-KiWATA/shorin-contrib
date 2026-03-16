@@ -1,0 +1,100 @@
+#!/bin/bash
+# Description: 检查待更新的软件包
+# ==============================================================================
+# 功能：终端下使用 fzf 显示所有待更新的软件包（Pacman, AUR, Flatpak）
+# 特性：支持 Matugen 兼容的颜色高亮，精确区分软件源，优先读取独立缓存秒开。
+# ==============================================================================
+
+set -euo pipefail
+
+# === 配置区域 ===
+CACHE_DIR="$HOME/.cache/shorin-check-arch-updates"
+CACHE_REPO="$CACHE_DIR/updates-repo.txt"
+CACHE_AUR="$CACHE_DIR/updates-aur.txt"
+CACHE_MAX_AGE=3600
+
+# 确保缓存目录存在 (防止在后台 Waybar 还未生成目录前手动运行脚本导致报错)
+mkdir -p "$CACHE_DIR"
+
+# === 颜色定义 (Matugen 兼容，使用 Bash ANSI C-quoting 转换为真实控制符) ===
+export C_TERTIARY=$'\x1b[1;35m'  # 洋红 - AUR / Flatpak (按你的设定)
+export C_PRIMARY=$'\x1b[1;34m'   # 蓝色 - Pacman / AUR (按你的设定)
+export C_CYAN=$'\x1b[1;36m'      # 青色 - Flatpak / Pacman (按你的设定)
+export C_RESET=$'\x1b[0m'        # 重置
+
+# === 工具函数 ===
+check_cmd() {
+    command -v "$1" &> /dev/null
+}
+
+# === 获取 Arch Linux 更新 (精确区分源) ===
+get_arch_updates() {
+    local use_cache=0
+
+    # 1. 检查缓存是否新鲜 (以 repo 缓存时间为准)
+    if [[ -f "$CACHE_REPO" ]]; then
+        local current_time file_time
+        current_time=$(date +%s)
+        file_time=$(stat -c %Y "$CACHE_REPO")
+        if (( current_time - file_time < CACHE_MAX_AGE )); then
+            use_cache=1
+        fi
+    fi
+
+    # 2. 输出数据 (利用 awk 注入颜色和对齐标签)
+    if (( use_cache == 1 )); then
+        # 缓存命中，分别读取独立的缓存文件
+        if [[ -s "$CACHE_REPO" ]]; then
+            grep -v '^\s*$' "$CACHE_REPO" | awk -v c1="$C_CYAN" -v cr="$C_RESET" '{print c1 "[Pacman]  " cr $0}' || true
+        fi
+        if [[ -s "$CACHE_AUR" ]]; then
+            grep -v '^\s*$' "$CACHE_AUR" | awk -v c1="$C_PRIMARY" -v cr="$C_RESET" '{print c1 "[AUR]     " cr $0}' || true
+        fi
+    else
+        # 缓存失效，主动触发 fallback 检查
+        if check_cmd checkupdates; then
+            checkupdates 2>/dev/null | awk -v c1="$C_CYAN" -v cr="$C_RESET" '{print c1 "[Pacman]  " cr $0}' || true
+        fi
+        
+        local aur_helper=""
+        if check_cmd paru; then
+            aur_helper="paru"
+        elif check_cmd yay; then
+            aur_helper="yay"
+        fi
+
+        if [[ -n "$aur_helper" ]]; then
+            "$aur_helper" -Qua 2>/dev/null | awk -v c1="$C_PRIMARY" -v cr="$C_RESET" '{print c1 "[AUR]     " cr $0}' || true
+        fi
+    fi
+}
+
+# === 获取 Flatpak 更新 ===
+get_flatpak_updates() {
+    if check_cmd flatpak; then
+        flatpak remote-ls --updates --columns=application,version 2>/dev/null | awk -v c1="$C_TERTIARY" -v cr="$C_RESET" '{print c1 "[Flatpak] " cr $0}' || true
+    fi
+}
+
+# === 主控制逻辑 ===
+main() {
+    if ! check_cmd fzf; then
+        echo "错误: 系统未安装 fzf。请先安装。" >&2
+        sleep 3
+        exit 1
+    fi
+
+    # 聚合输出并推送到 fzf，开启 --ansi 解析颜色
+    {
+        get_arch_updates
+        get_flatpak_updates
+    } | fzf \
+        --ansi \
+        --prompt="📦 待更新项目 > " \
+        --layout=reverse \
+        --info=inline \
+        --header="按 ESC 或 Enter 退出" \
+        --bind="enter:execute(echo {})+abort"
+}
+
+main
