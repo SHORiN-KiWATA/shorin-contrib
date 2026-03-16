@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Description: Flatpak 软件包模糊搜索与卸载 TUI
+# Features:
+#   1. 模糊搜索并批量卸载已安装的 Flatpak 软件包
+#   2. 无界排版：来源仓库 | 应用名称 | App ID，清爽纯净
+#   3. 巧妙利用 awk $NF 提取 ID，完美避开名称中的空格陷阱
+#   4. 安全卸载：保留原生数据删除确认机制，防止误删沙盒内重要数据
+#   5. 实时下半屏预览软件包详细信息
+# ==============================================================================
+# 启用严格的错误处理机制
+set -euo pipefail
+
+# --- 1. 环境与基础配置 ---
+ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
+SHOW_HELP=false
+QUERY_ARGS=()
+
+# 强制 C locale 确保 awk 解析的一致性
+export LC_ALL=C
+
+# --- 2. 参数解析 ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            SHOW_HELP=true
+            shift
+            ;;
+        *)
+            QUERY_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# --- 3. 本地化多语言字典 ---
+declare -A MSG
+if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
+    MSG[DESC]="模糊搜索并卸载已安装的 Flatpak 软件包。"
+    MSG[OPTS]="选项："
+    MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
+    MSG[FEAT]="功能特性："
+    MSG[FEAT_1]="- 安全机制：调用原生卸载，防误删 ~/.var/app 下的个人数据"
+    MSG[FEAT_2]="- 无界排版：清爽的空格对齐，拒绝多余符号"
+    MSG[FEAT_3]="- 原生调用：遵循 KISS 原则"
+    MSG[EX]="示例："
+    MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
+    MSG[ERR_HELPER]="错误：未找到 flatpak，请确认已在系统中安装并配置。"
+    MSG[REMOVING]=">> 准备卸载："
+    MSG[HEADER]="Tab:多选 | Enter:卸载 | Esc:退出"
+else
+    MSG[DESC]="Fuzzy search & remove installed Flatpak packages."
+    MSG[OPTS]="Options:"
+    MSG[OPT_HELP]="  --help, -h    Show this help and exit"
+    MSG[FEAT]="Features:"
+    MSG[FEAT_1]="- Safe Remove: Native uninstaller protects ~/.var/app data"
+    MSG[FEAT_2]="- Clean UI: Space-aligned, no messy delimiters"
+    MSG[FEAT_3]="- Native: KISS principle"
+    MSG[EX]="Example:"
+    MSG[ERR_FZF]="Error: fzf not found."
+    MSG[ERR_HELPER]="Error: flatpak not found."
+    MSG[REMOVING]=">> Preparing to remove:"
+    MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Esc:Exit"
+fi
+
+# --- 4. 帮助信息拦截 ---
+if [ "$SHOW_HELP" = true ]; then
+    cat <<EOF
+Usage: ${0##*/} [options] [query]
+
+${MSG[OPTS]}
+${MSG[OPT_HELP]}
+
+Description:
+  ${MSG[DESC]}
+
+${MSG[FEAT]}
+  ${MSG[FEAT_1]}
+  ${MSG[FEAT_2]}
+  ${MSG[FEAT_3]}
+
+${MSG[EX]}
+  ${0##*/} firefox      # 搜索并卸载 'firefox'
+  ${0##*/}              # 列出所有已安装的包
+EOF
+    exit 0
+fi
+
+# --- 5. 核心依赖检查 ---
+command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
+command -v flatpak >/dev/null 2>&1 || { echo "${MSG[ERR_HELPER]}" >&2; exit 1; }
+
+# --- 6. 异步逻辑与文件安全设置 ---
+TMP_DIR=$(mktemp -d -t flatpak_rm_fzf.XXXXXX)
+TARGET_FILE="${TMP_DIR}/target"
+PIPE_FIFO="${TMP_DIR}/fifo"
+mkfifo "$PIPE_FIFO"
+
+cleanup() {
+    if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# --- 7. 数据生成器 (后台运行) ---
+AWK_CMD='
+    {
+        if (NF < 3) next
+        origin = $1
+        app_id = $NF
+        
+        # 清空第一列和最后一列，剩下的部分即为软件名称 (保留了内部空格)
+        $1=""; $NF=""
+        name=$0
+        
+        # 清理名称前后多余的空格
+        sub(/^[ \t]+/, "", name)
+        sub(/[ \t]+$/, "", name)
+        
+        # 纯空格优雅对齐输出
+        printf "%s%-10s%s %-38s %s\n", c, origin, r, name, app_id
+    }
+'
+
+(
+    # 直接获取已安装的 APP 列表，强制列顺序为: origin, name, application
+    flatpak list --app --columns=origin,name,application | \
+    awk -v c='\033[36m' -v r='\033[0m' \
+        "$AWK_CMD"
+) > "$PIPE_FIFO" 2>/dev/null &
+
+PID_GEN=$!
+
+# --- 8. 交互式 FZF 渲染 ---
+COLOR_CYAN=$'\033[36m'
+COLOR_RESET=$'\033[0m'
+FZF_HEADER="${MSG[HEADER]} | ${COLOR_CYAN}Using Flatpak${COLOR_RESET}"
+
+# 预览逻辑：直接取当前行的最后一个字段 ($NF) 作为 App ID 进行 info 查询
+PREVIEW_CMD="a=\$(echo {} | awk '{print \$NF}'); flatpak info \"\$a\""
+
+set +e
+fzf --multi --ansi \
+    --preview "$PREVIEW_CMD" \
+    --preview-window=down:55%:wrap \
+    --height=95% --layout=reverse --border \
+    --tiebreak=index \
+    --nth=2.. \
+    --header "$FZF_HEADER" \
+    --query "${QUERY_ARGS[*]:-}" \
+    < "$PIPE_FIFO" \
+    > "$TARGET_FILE"
+FZF_EXIT=$?
+set -e
+
+# --- 9. 执行卸载 ---
+if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
+    mapfile -t SELECTED_LINES < "$TARGET_FILE"
+    PACKAGES=()
+    
+    for line in "${SELECTED_LINES[@]}"; do
+        # 获取每行的最后一个字段作为要卸载的 App ID
+        app_id=$(echo "$line" | awk '{print $NF}')
+        [[ -n "$app_id" ]] && PACKAGES+=("$app_id")
+    done
+    
+    if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+        echo -e "\n\033[34m${MSG[REMOVING]}\033[0m"
+        echo "${PACKAGES[*]}"
+        echo "----------------------------------------"
+        # 故意不加 --delete-data，让 flatpak 原生命令去询问用户是否删除数据，保障安全
+        flatpak uninstall "${PACKAGES[@]}"
+    fi
+fi

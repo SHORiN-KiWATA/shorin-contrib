@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Description: Flatpak 软件包模糊搜索与安装 TUI
+# Features:
+#   1. 模糊搜索并批量安装 Flatpak 软件包
+#   2. 自动检测系统并准确标记 [已安装] 的软件包
+#   3. 后台异步加载原生缓存数据，界面秒开不阻塞
+#   4. 清爽排版：来源仓库 | 应用名称 | App ID | 状态标记
+#   5. 巧妙利用 awk $NF 提取 ID，无需破坏视觉的定界符
+#   6. 实时下半屏预览软件包详细信息
+# ==============================================================================
+# 启用严格的错误处理机制
+set -euo pipefail
+
+# --- 1. 环境与基础配置 ---
+ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
+SHOW_HELP=false
+FORCE_REFRESH=false
+QUERY_ARGS=()
+
+export LC_ALL=C
+
+# --- 2. 参数解析 ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            SHOW_HELP=true
+            shift
+            ;;
+        --refresh|-y)
+            FORCE_REFRESH=true
+            shift
+            ;;
+        *)
+            QUERY_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# --- 3. 本地化多语言字典 ---
+declare -A MSG
+if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
+    MSG[DESC]="模糊搜索并安装 Flatpak 软件包。"
+    MSG[OPTS]="选项："
+    MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
+    MSG[OPT_REFRESH]="  --refresh, -y 强制更新 Flatpak AppStream 缓存"
+    MSG[FEAT]="功能特性："
+    MSG[FEAT_1]="- 准确状态：自动比对并显示 [已安装] 标记"
+    MSG[FEAT_2]="- 无界排版：清爽的空格对齐，拒绝多余符号"
+    MSG[FEAT_3]="- 原生调用：遵循 KISS 原则"
+    MSG[EX]="示例："
+    MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
+    MSG[ERR_HELPER]="错误：未找到 flatpak，请确认已在系统中安装并配置。"
+    MSG[INSTALLED]="[已安装]"
+    MSG[INSTALLING]=">> 准备安装："
+    MSG[REFRESHING]=">> 正在刷新 Flatpak 缓存..."
+    MSG[HEADER]="Tab:多选 | Enter:安装 | Esc:退出"
+else
+    MSG[DESC]="Fuzzy search & install Flatpak packages."
+    MSG[OPTS]="Options:"
+    MSG[OPT_HELP]="  --help, -h    Show this help and exit"
+    MSG[OPT_REFRESH]="  --refresh, -y Force update Flatpak AppStream cache"
+    MSG[FEAT]="Features:"
+    MSG[FEAT_1]="- Accurate status: [Installed] tag"
+    MSG[FEAT_2]="- Clean UI: Space-aligned, no messy delimiters"
+    MSG[FEAT_3]="- Native: KISS principle"
+    MSG[EX]="Example:"
+    MSG[ERR_FZF]="Error: fzf not found."
+    MSG[ERR_HELPER]="Error: flatpak not found."
+    MSG[INSTALLED]="[Installed]"
+    MSG[INSTALLING]=">> Installing:"
+    MSG[REFRESHING]=">> Refreshing Flatpak cache..."
+    MSG[HEADER]="Tab:Multi-Select | Enter:Install | Esc:Exit"
+fi
+
+# --- 4. 帮助信息拦截 ---
+if [ "$SHOW_HELP" = true ]; then
+    cat <<EOF
+Usage: ${0##*/} [options] [query]
+
+${MSG[OPTS]}
+${MSG[OPT_HELP]}
+${MSG[OPT_REFRESH]}
+
+Description:
+  ${MSG[DESC]}
+
+${MSG[FEAT]}
+  ${MSG[FEAT_1]}
+  ${MSG[FEAT_2]}
+  ${MSG[FEAT_3]}
+
+${MSG[EX]}
+  ${0##*/} obs          # 搜索 'obs'
+  ${0##*/} -y           # 强制刷新缓存并列出所有包
+EOF
+    exit 0
+fi
+
+# --- 5. 核心依赖检查 ---
+command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
+command -v flatpak >/dev/null 2>&1 || { echo "${MSG[ERR_HELPER]}" >&2; exit 1; }
+
+# --- 6. 异步逻辑与文件安全设置 ---
+TMP_DIR=$(mktemp -d -t flatpak_fzf.XXXXXX)
+TARGET_FILE="${TMP_DIR}/target"
+INSTALLED_LIST="${TMP_DIR}/installed"
+PIPE_FIFO="${TMP_DIR}/fifo"
+mkfifo "$PIPE_FIFO"
+
+cleanup() {
+    if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+if [[ "$FORCE_REFRESH" == true ]]; then
+    echo -e "\033[33m${MSG[REFRESHING]}\033[0m"
+    flatpak update --appstream
+fi
+
+flatpak list --app --columns=application > "$INSTALLED_LIST" || true
+
+# --- 7. 数据生成器 (后台运行) ---
+AWK_CMD='
+    FNR==NR { installed[$1]=1; next }
+    {
+        origin = $1
+        app_id = $2
+        
+        $1=""; $2=""
+        name=$0
+        sub(/^[ \t]+/, "", name)
+        
+        status = (app_id in installed) ? ci " ✔ " label r : ""
+        # 移除了竖线，采用纯空格优雅对齐
+        printf "%s%-10s%s %-38s %-35s%s\n", c, origin, r, name, app_id, status
+    }
+'
+
+(
+    flatpak remote-ls --app --cached --columns=origin,application,name | \
+    awk -v c='\033[36m' -v ci='\033[32m' -v r='\033[0m' \
+        -v label="${MSG[INSTALLED]}" \
+        "$AWK_CMD" "$INSTALLED_LIST" -
+) > "$PIPE_FIFO" 2>/dev/null &
+
+PID_GEN=$!
+
+# --- 8. 交互式 FZF 渲染 ---
+COLOR_CYAN=$'\033[36m'
+COLOR_RESET=$'\033[0m'
+FZF_HEADER="${MSG[HEADER]} | ${COLOR_CYAN}Using Flatpak${COLOR_RESET}"
+
+# 强健的预览解析逻辑：
+# 1. fzf 的 {} 代表当前选中的整行文本，自带安全转义。
+# 2. 用 sed 切除行尾可能的 " ✔ [已安装]" 标记。
+# 3. 剥离标记后，第一列 ($1) 必定是 origin，最后一列 ($NF) 必定是 App ID。
+PREVIEW_CMD="line={}; clean=\$(echo \"\$line\" | sed 's/ ✔ .*//'); o=\$(echo \"\$clean\" | awk '{print \$1}'); a=\$(echo \"\$clean\" | awk '{print \$NF}'); flatpak remote-info \"\$o\" \"\$a\""
+
+set +e
+fzf --multi --ansi \
+    --preview "$PREVIEW_CMD" \
+    --preview-window=down:55%:wrap \
+    --height=95% --layout=reverse --border \
+    --tiebreak=index \
+    --nth=2.. \
+    --header "$FZF_HEADER" \
+    --query "${QUERY_ARGS[*]:-}" \
+    < "$PIPE_FIFO" \
+    > "$TARGET_FILE"
+FZF_EXIT=$?
+set -e
+
+# --- 9. 执行安装 ---
+if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
+    mapfile -t SELECTED_LINES < "$TARGET_FILE"
+    PACKAGES=()
+    
+    for line in "${SELECTED_LINES[@]}"; do
+        # 同样的解析逻辑：剥离可能的状态标记，取最后一列 ($NF) 作为 App ID
+        clean=$(echo "$line" | sed 's/ ✔ .*//')
+        app_id=$(echo "$clean" | awk '{print $NF}')
+        [[ -n "$app_id" ]] && PACKAGES+=("$app_id")
+    done
+    
+    if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+        echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
+        echo "${PACKAGES[*]}"
+        echo "----------------------------------------"
+        flatpak install "${PACKAGES[@]}"
+    fi
+fi
