@@ -91,14 +91,25 @@ get_flatpak_updates() {
 
 # === 主控制逻辑 ===
 main() {
-    # ---------------------------------------------------------
+# ---------------------------------------------------------
     # 分支 1：Ctrl+R 触发的重载刷新进程
     # ---------------------------------------------------------
     if [[ $FORCE_REFRESH == 1 ]]; then
-        # 1. 异步唤醒 Waybar（即发即弃），让它在后台自己慢慢同步 UI
-        pkill -SIGUSR1 -f "~/.config/waybar/scripts/check-updates.sh" || true
+        # 1. 唤醒 Waybar 后台守护进程去干活
+        pkill -SIGUSR1 -f "check-updates.sh" || true
         
-        # 2. 前端 fzf 立即独立执行查询并输出，不等待 Waybar 锁，保证 UI 响应速度
+        # 2. 停顿 0.2 秒，确保 Waybar 的 trap 已经触发并拿到了独占文件锁
+        sleep 0.2
+        
+        # 3. 核心修复：使用 flock 阻塞等待！
+        # 避免与 Waybar 争抢 Pacman 的 db.lck 锁。我们在这里排队，
+        # 一旦拿到锁，说明 Waybar 已经查完并写好了最新缓存。
+        (
+            flock -x -w 120 9
+        ) 9>"/tmp/waybar-updates.lock" || true
+        
+        # 4. Waybar 已经准备好了最新鲜的数据，把刷新标志归零，直接走缓存极速读取！
+        FORCE_REFRESH=0
         get_arch_updates
         get_flatpak_updates
         exit 0
@@ -130,9 +141,6 @@ main() {
         
         shorin sysup
         
-        # 更新完成后，系统状态已变，顺手让 Waybar 刷新一次状态变回“无更新”
-        pkill -SIGUSR1 -f "~/.config/waybar/scripts/check-updates.sh" || true
-
         echo -e "\n${C_PRIMARY}更新流程结束${C_RESET}"
 
         # === 智能终端暂停逻辑 ===
