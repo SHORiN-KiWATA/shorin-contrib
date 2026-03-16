@@ -1,11 +1,25 @@
 #!/bin/bash
-# Description: 检查待更新的软件包
 # ==============================================================================
-# 功能：终端下使用 fzf 显示所有待更新的软件包（Pacman, AUR, Flatpak）
-# 特性：支持 Matugen 兼容的颜色高亮，精确区分软件源，优先读取独立缓存秒开。
+# 脚本名称：shorin-check-arch-updates
+# 功能描述：终端下使用 fzf 显示所有待更新的软件包（Pacman, AUR, Flatpak）
+# 特性：
+#   1. 颜色高亮：支持 Matugen 兼容的颜色高亮，精确区分软件源。
+#   2. 极速启动：优先读取 Waybar 独立缓存，实现秒开。
+#   3. 交互更新：按 Enter 调用 shorin sysup，并带智能上下文感知防闪退。
+#   4. 异步刷新：Ctrl+R 强制刷新时，前端独立测速并展示，同时异步唤醒 Waybar 
+#      后台更新状态，互不阻塞，保证极致流畅度。
 # ==============================================================================
 
 set -euo pipefail
+
+# === 获取脚本自身的绝对路径 (供 fzf reload 使用) ===
+SCRIPT_PATH=$(readlink -f "$0")
+
+# === 解析内部参数 ===
+FORCE_REFRESH=0
+if [[ "${1:-}" == "--refresh" ]]; then
+    FORCE_REFRESH=1
+fi
 
 # === 配置区域 ===
 CACHE_DIR="$HOME/.cache/shorin-check-arch-updates"
@@ -13,13 +27,13 @@ CACHE_REPO="$CACHE_DIR/updates-repo.txt"
 CACHE_AUR="$CACHE_DIR/updates-aur.txt"
 CACHE_MAX_AGE=3600
 
-# 确保缓存目录存在 (防止在后台 Waybar 还未生成目录前手动运行脚本导致报错)
+# 确保缓存目录存在
 mkdir -p "$CACHE_DIR"
 
-# === 颜色定义 (Matugen 兼容，使用 Bash ANSI C-quoting 转换为真实控制符) ===
-export C_TERTIARY=$'\x1b[1;35m'  # 洋红 - AUR / Flatpak (按你的设定)
-export C_PRIMARY=$'\x1b[1;34m'   # 蓝色 - Pacman / AUR (按你的设定)
-export C_CYAN=$'\x1b[1;36m'      # 青色 - Flatpak / Pacman (按你的设定)
+# === 颜色定义 (Matugen 兼容) ===
+export C_TERTIARY=$'\x1b[1;35m'  # 洋红 - Flatpak
+export C_PRIMARY=$'\x1b[1;34m'   # 蓝色 - AUR
+export C_CYAN=$'\x1b[1;36m'      # 青色 - Pacman
 export C_RESET=$'\x1b[0m'        # 重置
 
 # === 工具函数 ===
@@ -27,12 +41,12 @@ check_cmd() {
     command -v "$1" &> /dev/null
 }
 
-# === 获取 Arch Linux 更新 (精确区分源) ===
+# === 获取 Arch Linux 更新 ===
 get_arch_updates() {
     local use_cache=0
 
-    # 1. 检查缓存是否新鲜 (以 repo 缓存时间为准)
-    if [[ -f "$CACHE_REPO" ]]; then
+    # 如果不是独立的强制刷新，且缓存存在，则验证缓存新鲜度
+    if [[ $FORCE_REFRESH == 0 ]] && [[ -f "$CACHE_REPO" ]]; then
         local current_time file_time
         current_time=$(date +%s)
         file_time=$(stat -c %Y "$CACHE_REPO")
@@ -41,9 +55,8 @@ get_arch_updates() {
         fi
     fi
 
-    # 2. 输出数据 (利用 awk 注入颜色和对齐标签)
     if (( use_cache == 1 )); then
-        # 缓存命中，分别读取独立的缓存文件
+        # 走缓存极速输出
         if [[ -s "$CACHE_REPO" ]]; then
             grep -v '^\s*$' "$CACHE_REPO" | awk -v c1="$C_CYAN" -v cr="$C_RESET" '{print c1 "[Pacman]  " cr $0}' || true
         fi
@@ -51,7 +64,7 @@ get_arch_updates() {
             grep -v '^\s*$' "$CACHE_AUR" | awk -v c1="$C_PRIMARY" -v cr="$C_RESET" '{print c1 "[AUR]     " cr $0}' || true
         fi
     else
-        # 缓存失效，主动触发 fallback 检查
+        # 缓存失效或 Ctrl+R 强制刷新时的独立查询机制（绕过缓存）
         if check_cmd checkupdates; then
             checkupdates 2>/dev/null | awk -v c1="$C_CYAN" -v cr="$C_RESET" '{print c1 "[Pacman]  " cr $0}' || true
         fi
@@ -78,14 +91,29 @@ get_flatpak_updates() {
 
 # === 主控制逻辑 ===
 main() {
+    # ---------------------------------------------------------
+    # 分支 1：Ctrl+R 触发的重载刷新进程
+    # ---------------------------------------------------------
+    if [[ $FORCE_REFRESH == 1 ]]; then
+        # 1. 异步唤醒 Waybar（即发即弃），让它在后台自己慢慢同步 UI
+        pkill -SIGUSR1 -f "~/.config/waybar/scripts/check-updates.sh" || true
+        
+        # 2. 前端 fzf 立即独立执行查询并输出，不等待 Waybar 锁，保证 UI 响应速度
+        get_arch_updates
+        get_flatpak_updates
+        exit 0
+    fi
+
+    # ---------------------------------------------------------
+    # 分支 2：主进程逻辑，启动 fzf UI 界面
+    # ---------------------------------------------------------
     if ! check_cmd fzf; then
         echo "错误: 系统未安装 fzf。请先安装。" >&2
         sleep 3
         exit 1
     fi
 
-    # 聚合输出并推送到 fzf，开启 --ansi 解析颜色
-    {
+    if {
         get_arch_updates
         get_flatpak_updates
     } | fzf \
@@ -93,8 +121,29 @@ main() {
         --prompt="📦 待更新项目 > " \
         --layout=reverse \
         --info=inline \
-        --header="按 ESC 或 Enter 退出" \
-        --bind="enter:execute(echo {})+abort"
+        --header="ESC退出 | Enter更新系统 | Ctrl+R强制刷新" \
+        --bind="ctrl-r:change-prompt(⏳ 正在拉取最新数据... > )+reload('${SCRIPT_PATH}' --refresh)+change-prompt(📦 待更新项目 > )" \
+        > /dev/null; then
+        
+        clear
+        echo -e "${C_CYAN}正在启动系统更新 (shorin sysup)...${C_RESET}\n"
+        
+        shorin sysup
+        
+        # 更新完成后，系统状态已变，顺手让 Waybar 刷新一次状态变回“无更新”
+        pkill -SIGUSR1 -f "~/.config/waybar/scripts/check-updates.sh" || true
+
+        echo -e "\n${C_PRIMARY}更新流程结束${C_RESET}"
+
+        # === 智能终端暂停逻辑 ===
+        local parent_cmd
+        parent_cmd=$(ps -o comm= -p $PPID 2>/dev/null | sed 's/^-//' || true)
+        
+        if ! [[ "$parent_cmd" =~ ^(bash|zsh|fish|tcsh|tmux|screen)$ ]]; then
+            echo -e "${C_TERTIARY}按任意键关闭窗口...${C_RESET}"
+            read -n 1 -s
+        fi
+    fi
 }
 
 main

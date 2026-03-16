@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Description: 软件包模糊搜索与安装 TUI
+# Description: Pacman/AUR软件包模糊搜索与安装 TUI
 # ==============================================================================
 # 启用严格的错误处理机制
 set -euo pipefail
