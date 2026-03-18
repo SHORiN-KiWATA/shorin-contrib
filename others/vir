@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Description: 简单管理qemu虚拟机
+# ==============================================================================
+# 功能描述: 仿 impala 风格的 QEMU/KVM 终端仪表盘 (TUI) - 极简稳定版
+# 支持功能:
+#   1. 纯净边框美学，严格左对齐 (保证在任何终端宽度下不错位)
+#   2. 运行中的虚拟机置顶排布 (绿色)，已关机的靠后排布 (暗色)
+#   3. [Enter] 软启停：启动关机的虚拟机，平滑关闭运行中的虚拟机
+#   4. [S] 强制断电：(Shift + s) 直接摧毁进程，解决卡死问题
+#   5. [o] 打开界面：通过 virt-viewer --attach 独立后台运行
+#   6. 纯正 Vim 快捷键驱动，底部状态栏快捷键提示 (彻底修复隐形Bug)
+#
+# 设计理念: KISS 原则，拒绝脆弱的排版 hack，回归最稳定的终端输出格式。
+# ==============================================================================
+
+# 严格模式：遇到错误停止、未定义变量报错。
+set -eu
+
+export LC_ALL=C
+URI="qemu:///system"
+VIEWER_CMD="virt-viewer"
+
+# ==============================================================================
+# 内部路由处理器 (供 fzf 回调执行)
+# ==============================================================================
+if [[ "${1:-}" == "_internal_list" ]]; then
+    virsh -c "$URI" list --all | awk 'NR>2 && NF>0 {
+        name = $2
+        state = $3
+        for(i=4; i<=NF; i++) state = state " " $i
+        
+        # 视觉分组逻辑
+        if (state == "running") {
+            sort_key = 1
+            color_state = "\033[1;32m" state "\033[0m"
+            color_name  = "\033[1;37m" name "\033[0m"
+        } else {
+            sort_key = 2
+            color_state = "\033[1;30m" state "\033[0m"
+            color_name  = "\033[1;30m" name "\033[0m"
+        }
+        
+        # 恢复左对齐，保证极度稳定的列对齐
+        display = sprintf("  %-30s %s", color_name, color_state)
+        printf "%d|%s|%s|%s\n", sort_key, name, state, display
+    }' | sort -n | awk -F'|' '{printf "%s|%s|%s\n", $2, $3, $4}'
+    exit 0
+
+elif [[ "${1:-}" == "_internal_toggle" ]]; then
+    name=$(echo "$2" | xargs)
+    state=$(echo "$3" | xargs)
+    if [[ "$state" == "running" ]]; then
+        virsh -c "$URI" shutdown "$name" >/dev/null 2>&1 || true
+    else
+        virsh -c "$URI" start "$name" >/dev/null 2>&1 || true
+    fi
+    exit 0
+
+elif [[ "${1:-}" == "_internal_force_off" ]]; then
+    name=$(echo "$2" | xargs)
+    state=$(echo "$3" | xargs)
+    if [[ "$state" == "running" ]]; then
+        # 强制拔掉电源 (Shift + s 触发)
+        virsh -c "$URI" destroy "$name" >/dev/null 2>&1 || true
+    fi
+    exit 0
+
+elif [[ "${1:-}" == "_internal_open" ]]; then
+    name=$(echo "$2" | xargs)
+    state=$(echo "$3" | xargs)
+    if [[ "$state" == "running" ]]; then
+        setsid "$VIEWER_CMD" --attach -c "$URI" "$name" >/dev/null 2>&1 &
+    fi
+    exit 0
+fi
+
+# ==============================================================================
+# 主程序 (UI 渲染与事件循环)
+# ==============================================================================
+
+for cmd in virsh fzf awk xargs; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "致命错误: 未找到 $cmd 命令。" >&2
+        exit 1
+    fi
+done
+
+SCRIPT_PATH=$(realpath "$0")
+
+# Impala 风格的主题颜色
+
+HEADER="  Name                           State       "
+# 快捷键说明 (S大写防误触)
+FOOTER=" ↵ or ⏎ Start/Soft-Off | S Force Off | o Open GUI | r Refresh | q Quit "
+
+# 启动引擎
+# 注意 preview 中的 printf '%s'，不带任何换行符，完美适配 1 行高度的预览窗口
+FZF_DEFAULT_COMMAND="\"$SCRIPT_PATH\" _internal_list" \
+fzf --ansi \
+    --layout=reverse \
+    --info=hidden \
+    --prompt="  " \
+    --border=rounded \
+    --border-label=" Virtual Machines " \
+    --border-label-pos=3 \
+    --header="$HEADER" \
+    --delimiter='\|' \
+    --with-nth=3 \
+    --bind "j:down,k:up" \
+    --bind "enter:execute-silent(\"$SCRIPT_PATH\" _internal_toggle {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "S:execute-silent(\"$SCRIPT_PATH\" _internal_force_off {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "o:execute-silent(\"$SCRIPT_PATH\" _internal_open {1} {2})" \
+    --bind "r:reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "q:abort,esc:abort" \
+    --bind "space:disable-search" \
+    --preview="printf '%s' \"$FOOTER\"" \
+    --preview-window="bottom,1,border-top"
