@@ -6,6 +6,7 @@
 #   3. 巧妙利用 awk $NF 提取 ID，完美避开名称中的空格陷阱
 #   4. 安全卸载：保留原生数据删除确认机制，防止误删沙盒内重要数据
 #   5. 实时下半屏预览软件包详细信息
+#   6. 统一工程标准：兼容性更强的 mktemp 方案与友好的“空列表”提示
 # ==============================================================================
 # 启用严格的错误处理机制
 set -euo pipefail
@@ -90,7 +91,8 @@ command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
 command -v flatpak >/dev/null 2>&1 || { echo "${MSG[ERR_HELPER]}" >&2; exit 1; }
 
 # --- 6. 异步逻辑与文件安全设置 ---
-TMP_DIR=$(mktemp -d -t flatpak_rm_fzf.XXXXXX)
+# 修改：使用更健壮的 mktemp 形式
+TMP_DIR=$(mktemp -d /tmp/flatpak_rm_fzf.XXXXXX)
 TARGET_FILE="${TMP_DIR}/target"
 PIPE_FIFO="${TMP_DIR}/fifo"
 mkfifo "$PIPE_FIFO"
@@ -122,11 +124,16 @@ AWK_CMD='
 '
 
 (
-    # 直接获取已安装的 APP 列表，强制列顺序为: origin, name, application
-    flatpak list --app --columns=origin,name,application | \
-    awk -v c='\033[36m' -v r='\033[0m' \
-        "$AWK_CMD"
-) > "$PIPE_FIFO" 2>/dev/null &
+    # 修改：先获取数据，防范“零安装”导致的界面空白体验
+    RAW_DATA=$(flatpak list --app --columns=origin,name,application 2>/dev/null || true)
+    
+    if [[ -n "$RAW_DATA" ]]; then
+        echo "$RAW_DATA" | awk -v c='\033[36m' -v r='\033[0m' "$AWK_CMD"
+    else
+        # 如果什么都没安装，给出一个优雅的占位提示
+        printf "\033[33m%-10s\033[0m \033[31m%-38s\033[0m %s\n" "System" "No Flatpak applications installed." "empty.list"
+    fi
+) > "$PIPE_FIFO" &
 
 PID_GEN=$!
 
@@ -160,7 +167,11 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     for line in "${SELECTED_LINES[@]}"; do
         # 获取每行的最后一个字段作为要卸载的 App ID
         app_id=$(echo "$line" | awk '{print $NF}')
-        [[ -n "$app_id" ]] && PACKAGES+=("$app_id")
+        
+        # 排除掉我们在空列表时塞进去的占位符 "empty.list"
+        if [[ "$app_id" != "empty.list" && -n "$app_id" ]]; then
+            PACKAGES+=("$app_id")
+        fi
     done
     
     if [[ ${#PACKAGES[@]} -gt 0 ]]; then
