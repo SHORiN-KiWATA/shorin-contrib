@@ -12,7 +12,7 @@
 # 8. 清理旧 Btrfs 快照与 btrfs-assistant 的冗余备份子卷 (all 模式下利用 snapper 命令清空快照但保留 before 节点)
 
 set -euo pipefail
-export SHELL="$(command -v bash || echo /bin/bash)"
+#export SHELL="$(command -v bash || echo /bin/bash)"
 
 # ===============================================================
 # Arch Linux System Cleanup Assistant (Best Version)

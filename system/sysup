@@ -4,7 +4,7 @@
 # 开启严格模式：遇到错误、未定义变量、管道错误即停止运行
 set -euo pipefail
 
-export SHELL="$(command -v bash || echo /bin/bash)"
+#export SHELL="$(command -v bash || echo /bin/bash)"
 
 # ===============================================================
 # Arch Linux 系统更新助手 (完美版 - 集成镜像源检查)
