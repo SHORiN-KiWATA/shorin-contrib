@@ -89,7 +89,6 @@ SCRIPT_PATH=$(realpath "$0")
 
 # Impala 风格的主题颜色
 
-HEADER="  Name                           State       "
 # 快捷键说明 (S大写防误触)
 FOOTER=" ↵ or ⏎ Start/Soft-Off | S Force Off | o Open GUI | r Refresh | q Quit "
 
@@ -103,7 +102,6 @@ fzf --ansi \
     --border=rounded \
     --border-label=" Virtual Machines " \
     --border-label-pos=3 \
-    --header="$HEADER" \
     --delimiter='\|' \
     --with-nth=3 \
     --bind "j:down,k:up" \
