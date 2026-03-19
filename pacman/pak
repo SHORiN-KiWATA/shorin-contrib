@@ -14,6 +14,8 @@
 # 启用严格的错误处理机制
 set -euo pipefail
 
+export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells)
+
 # --- 1. 环境与基础配置 ---
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
 SHOW_HELP=false
