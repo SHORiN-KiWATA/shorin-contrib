@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Description: 降级软件的TUI (基于downgrade)
+# Description: 基于 downgrade 的软件包降级 TUI
 # Features:
 #   1. 模糊搜索已安装软件包并传递给 downgrade 进行版本回退
-#   2. 自动检测系统是否安装 downgrade 工具
+#   2. 自动检测系统依赖 (fzf, downgrade, paru/yay)
 #   3. 动态追溯并显示包的真实来源 (core/extra/aur 等)
 #   4. 严格执行前置高危操作安全警告，防止破坏系统依赖链
 #   5. 实时下半屏预览软件包详细信息
 # ==============================================================================
+
 # 启用严格的错误处理机制
 set -euo pipefail
 
@@ -43,11 +44,14 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[FEAT_2]="- 精准追溯：动态比对显示包的真实来源 (core/extra/aur 等)"
     MSG[FEAT_3]="- 依赖安全：移交 pacman 进行底层依赖拦截，并提供强警告"
     MSG[EX]="示例："
-    MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
-    MSG[ERR_DOWNGRADE]="错误：未找到 downgrade，请先从 AUR 安装 (例如: paru -S downgrade)。"
-    MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为预览助手。"
+    
+    # 依赖报错字典 (支持 printf 格式化注入变量)
+    MSG[ERR_DEPS]="\033[1;31m[错误] 缺少核心依赖程序！\033[0m\n未找到命令: \033[1;33m%s\033[0m\n参考安装: \033[32msudo pacman -S %s\033[0m\n"
+    MSG[ERR_HELPER]="\033[1;31m[错误] 未找到 AUR 助手！\033[0m\n请至少安装 \033[32mparu\033[0m 或 \033[32myay\033[0m 以支持包信息预览。\n"
+    MSG[ERR_DOWNGRADE]="\033[1;31m[错误] 未找到 downgrade 工具！\033[0m\n此脚本强依赖该工具执行版本回退操作。\n参考安装: \033[32m%s -S downgrade\033[0m\n"
+    
     MSG[DOWNGRADING]=">> 准备降级："
-    MSG[WARN_DEP]="[⚠️ 依赖危险警告] 降级核心库(如 glibc, mesa, python 等)极易导致系统崩溃！"
+    MSG[WARN_DEP]="[依赖危险警告] 降级核心库(如 glibc, mesa, python 等)极易导致系统崩溃！"
     MSG[HEADER]="Tab:多选 | Enter:降级 | Esc:退出"
 else
     MSG[DESC]="Fuzzy search and downgrade installed packages."
@@ -58,11 +62,13 @@ else
     MSG[FEAT_2]="- Exact Origin: Dynamically maps package to real repo"
     MSG[FEAT_3]="- Dependency Safety: Relies on pacman strictly, with pre-execution warnings"
     MSG[EX]="Example:"
-    MSG[ERR_FZF]="Error: fzf not found."
-    MSG[ERR_DOWNGRADE]="Error: downgrade tool not found. Please install it from AUR."
-    MSG[ERR_HELPER]="Error: Neither paru nor yay found for previewing."
+    
+    MSG[ERR_DEPS]="\033[1;31m[Error] Missing core dependencies!\033[0m\nCommands not found: \033[1;33m%s\033[0m\nInstall via: \033[32msudo pacman -S %s\033[0m\n"
+    MSG[ERR_HELPER]="\033[1;31m[Error] AUR helper not found!\033[0m\nPlease install \033[32mparu\033[0m or \033[32myay\033[0m to support package previews.\n"
+    MSG[ERR_DOWNGRADE]="\033[1;31m[Error] downgrade tool not found!\033[0m\nThis script strictly requires 'downgrade' to operate.\nInstall via: \033[32m%s -S downgrade\033[0m\n"
+    
     MSG[DOWNGRADING]=">> Preparing to downgrade:"
-    MSG[WARN_DEP]="[⚠️ DANGER] Downgrading core libs can break your system!"
+    MSG[WARN_DEP]="[DANGER] Downgrading core libs can break your system!"
     MSG[HEADER]="Tab:Multi-Select | Enter:Downgrade | Esc:Exit"
 fi
 
@@ -90,18 +96,41 @@ EOF
 fi
 
 # --- 5. 核心依赖检查与动态 Helper 探测 ---
-command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
-command -v downgrade >/dev/null 2>&1 || { echo "${MSG[ERR_DOWNGRADE]}" >&2; exit 1; }
-
 AUR_HELPER=""
 if command -v paru >/dev/null 2>&1; then
     AUR_HELPER="paru"
-    elif command -v yay >/dev/null 2>&1; then
+elif command -v yay >/dev/null 2>&1; then
     AUR_HELPER="yay"
-else
-    echo "${MSG[ERR_HELPER]}" >&2
-    exit 1
 fi
+
+check_dependencies() {
+    # 1. 检查基础 CLI 工具
+    local missing_deps=()
+    for cmd in fzf awk pacman; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_deps+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        printf "${MSG[ERR_DEPS]}" "${missing_deps[*]}" "${missing_deps[*]}" >&2
+        exit 1
+    fi
+
+    # 2. 检查 AUR 助手 (提供预览功能，也是安装 downgrade 的前提)
+    if [[ -z "$AUR_HELPER" ]]; then
+        echo -e "${MSG[ERR_HELPER]}" >&2
+        exit 1
+    fi
+
+    # 3. 检查 downgrade 工具 (强依赖，动态生成安装命令)
+    if ! command -v downgrade >/dev/null 2>&1; then
+        printf "${MSG[ERR_DOWNGRADE]}" "$AUR_HELPER" >&2
+        exit 1
+    fi
+}
+
+check_dependencies
 
 # --- 6. 异步逻辑与文件安全设置 ---
 TMP_DIR=$(mktemp -d -t pacd_fzf.XXXXXX)
@@ -134,7 +163,7 @@ NR==FNR {
     if (pkg_name in repo) {
         # 存在于源中 -> 官方源或第三方源 (蓝色)
         printf "%s%-16s%s %-30s %s\n", cb, repo[pkg_name], r, pkg_name, pkg_ver
-        } else {
+    } else {
         # 不存在于源中 -> 纯正的外来/AUR包 (紫色)
         printf "%s%-16s%s %-30s %s\n", cp, "aur", r, pkg_name, pkg_ver
     }
