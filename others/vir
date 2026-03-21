@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Description: 简单的QEMU虚拟机管理TUI
+# Description: 简单管理qemu虚拟机
 # ==============================================================================
 # 功能描述: 仿 impala 风格的 QEMU/KVM 终端仪表盘 (TUI) - 极简稳定版
 # 支持功能:
@@ -15,8 +15,8 @@
 # 设计理念: KISS 原则，拒绝脆弱的排版 hack，回归最稳定的终端输出格式。
 # ==============================================================================
 
-# 严格模式：遇到错误停止、未定义变量报错、管道中任一命令失败则整体失败
-set -euo pipefail
+# 严格模式：遇到错误停止、未定义变量报错。
+set -eu
 
 export LC_ALL=C
 URI="qemu:///system"
@@ -30,8 +30,8 @@ if [[ "${1:-}" == "_internal_list" ]]; then
         name = $2
         state = $3
         for(i=4; i<=NF; i++) state = state " " $i
-
-        # 状态分组与着色
+        
+        # 视觉分组逻辑
         if (state == "running") {
             sort_key = 1
             color_state = "\033[1;32m" state "\033[0m"
@@ -41,14 +41,14 @@ if [[ "${1:-}" == "_internal_list" ]]; then
             color_state = "\033[1;30m" state "\033[0m"
             color_name  = "\033[1;30m" name "\033[0m"
         }
-
-        # 格式化输出，保持列宽对齐
+        
+        # 恢复左对齐，保证极度稳定的列对齐
         display = sprintf("  %-30s %s", color_name, color_state)
         printf "%d|%s|%s|%s\n", sort_key, name, state, display
     }' | sort -n | awk -F'|' '{printf "%s|%s|%s\n", $2, $3, $4}'
     exit 0
-    
-    elif [[ "${1:-}" == "_internal_toggle" ]]; then
+
+elif [[ "${1:-}" == "_internal_toggle" ]]; then
     name=$(echo "$2" | xargs)
     state=$(echo "$3" | xargs)
     if [[ "$state" == "running" ]]; then
@@ -68,16 +68,17 @@ if [[ "${1:-}" == "_internal_list" ]]; then
         virsh -c "$URI" start "$name" >/dev/null 2>&1 || true
     fi
     exit 0
-    
-    elif [[ "${1:-}" == "_internal_force_off" ]]; then
+
+elif [[ "${1:-}" == "_internal_force_off" ]]; then
     name=$(echo "$2" | xargs)
     state=$(echo "$3" | xargs)
     if [[ "$state" == "running" ]]; then
+        # 强制拔掉电源 (Shift + s 触发)
         virsh -c "$URI" destroy "$name" >/dev/null 2>&1 || true
     fi
     exit 0
-    
-    elif [[ "${1:-}" == "_internal_reboot" ]]; then
+
+elif [[ "${1:-}" == "_internal_reboot" ]]; then
     name=$(echo "$2" | xargs)
     state=$(echo "$3" | xargs)
     if [[ "$state" == "running" ]]; then
@@ -85,8 +86,8 @@ if [[ "${1:-}" == "_internal_list" ]]; then
         virsh -c "$URI" reboot "$name" >/dev/null 2>&1 || true
     fi
     exit 0
-    
-    elif [[ "${1:-}" == "_internal_force_reboot" ]]; then
+
+elif [[ "${1:-}" == "_internal_force_reboot" ]]; then
     name=$(echo "$2" | xargs)
     state=$(echo "$3" | xargs)
     if [[ "$state" == "running" ]]; then
@@ -94,80 +95,51 @@ if [[ "${1:-}" == "_internal_list" ]]; then
         virsh -c "$URI" reset "$name" >/dev/null 2>&1 || true
     fi
     exit 0
-    
-    elif [[ "${1:-}" == "_internal_open" ]]; then
+
+elif [[ "${1:-}" == "_internal_open" ]]; then
     name=$(echo "$2" | xargs)
     state=$(echo "$3" | xargs)
     if [[ "$state" == "running" ]]; then
-        # 后台静默执行，避免阻塞主面板
         setsid "$VIEWER_CMD" --attach -c "$URI" "$name" >/dev/null 2>&1 &
     fi
     exit 0
 fi
 
 # ==============================================================================
-# 依赖检查与环境初始化 (仅在主进程执行，避免 fzf 回调时重复执行)
-# ==============================================================================
-check_dependencies() {
-    local missing_hard_deps=()
-    for cmd in virsh fzf awk xargs; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing_hard_deps+=("$cmd")
-        fi
-    done
-    
-    # 强依赖检查：缺失则中断并输出安装参考命令
-    if [[ ${#missing_hard_deps[@]} -gt 0 ]]; then
-        echo -e "\033[1;31m[错误] 缺少核心依赖程序！\033[0m" >&2
-        echo -e "未找到命令: \033[1;33m${missing_hard_deps[*]}\033[0m\n" >&2
-        echo -e "参考安装命令:" >&2
-        echo -e "  Debian/Ubuntu: \033[32msudo apt install libvirt-clients fzf gawk findutils\033[0m" >&2
-        echo -e "  RHEL/Fedora:   \033[32msudo dnf install libvirt-client fzf gawk findutils\033[0m" >&2
-        echo -e "  Arch Linux:    \033[32msudo pacman -S libvirt fzf gawk findutils\033[0m" >&2
-        exit 1
-    fi
-    
-    # 软依赖检查：缺失不影响 CLI 管理功能
-    if ! command -v "$VIEWER_CMD" >/dev/null 2>&1; then
-        echo -e "\033[1;33m[警告] 未找到 $VIEWER_CMD 命令。\033[0m" >&2
-        echo -e "快捷键 \033[1;37m[o] 打开图形界面\033[0m 功能将受限。" >&2
-        echo -e "如需使用该功能，请安装 \033[32mvirt-viewer\033[0m。\n" >&2
-        # 强制从 /dev/tty 读取，确保在各种调用场景下交互正常
-        read -r -p "按 [Enter] 键继续启动面板..." < /dev/tty
-    fi
-}
-
-check_dependencies
-
-# ==============================================================================
 # 主程序 (UI 渲染与事件循环)
 # ==============================================================================
 
+for cmd in virsh fzf awk xargs; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "致命错误: 未找到 $cmd 命令。" >&2
+        exit 1
+    fi
+done
+
 SCRIPT_PATH=$(realpath "$0")
 
-# 快捷键说明栏 (S 大写防误触)
-FOOTER=" ↵ or ⏎ Start/Soft-Off | S Force Off | o Open GUI | r Refresh | q Quit "
+# 快捷键说明更新
+FOOTER=" ↵ Start/Soft-Off | S Force Off | r Reboot | R Force Reset | o GUI | ctrl-r Refresh | q Quit "
 
-# 启动 fzf 面板
-# preview_window 设为底部 1 行，利用 printf '%s' 防止额外换行，将其作为状态栏使用
+# 启动引擎
 FZF_DEFAULT_COMMAND="\"$SCRIPT_PATH\" _internal_list" \
 fzf --ansi \
---layout=reverse \
---info=hidden \
---prompt="  " \
---border=rounded \
---border-label=" Virtual Machines " \
---border-label-pos=3 \
---delimiter='\|' \
---with-nth=3 \
---bind "j:down,k:up" \
---bind "enter:execute-silent(\"$SCRIPT_PATH\" _internal_toggle {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
---bind "S:execute-silent(\"$SCRIPT_PATH\" _internal_force_off {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
---bind "r:execute-silent(\"$SCRIPT_PATH\" _internal_reboot {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
---bind "R:execute-silent(\"$SCRIPT_PATH\" _internal_force_reboot {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
---bind "o:execute-silent(\"$SCRIPT_PATH\" _internal_open {1} {2})" \
---bind "ctrl-r:reload(\"$SCRIPT_PATH\" _internal_list)" \
---bind "q:abort,esc:abort" \
---bind "space:disable-search" \
---preview="printf '%s' \"$FOOTER\"" \
---preview-window="bottom,1,border-top"
+    --layout=reverse \
+    --info=hidden \
+    --prompt="  " \
+    --border=rounded \
+    --border-label=" Virtual Machines " \
+    --border-label-pos=3 \
+    --delimiter='\|' \
+    --with-nth=3 \
+    --bind "j:down,k:up" \
+    --bind "enter:execute-silent(\"$SCRIPT_PATH\" _internal_toggle {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "S:execute-silent(\"$SCRIPT_PATH\" _internal_force_off {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "r:execute-silent(\"$SCRIPT_PATH\" _internal_reboot {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "R:execute-silent(\"$SCRIPT_PATH\" _internal_force_reboot {1} {2})+reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "o:execute-silent(\"$SCRIPT_PATH\" _internal_open {1} {2})" \
+    --bind "ctrl-r:reload(\"$SCRIPT_PATH\" _internal_list)" \
+    --bind "q:abort,esc:abort" \
+    --bind "space:disable-search" \
+    --preview="printf '%s' \"$FOOTER\"" \
+    --preview-window="bottom,1,border-top"
