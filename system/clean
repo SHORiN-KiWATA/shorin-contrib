@@ -8,11 +8,10 @@
 # 4. 清理 Systemd 日志 (只保留最近 2 周)
 # 5. 清空用户回收站 (Trash) 和缩略图缓存 (Thumbnails)
 # 6. 移除未使用的 Flatpak 运行时
-# 7. 清理截图与录屏目录 (Screenshots & wf-recorder)
+# 7. 清理截图与录屏目录 (Screenshots, wf-recorder & shorin-screenrec)
 # 8. 清理旧 Btrfs 快照与 btrfs-assistant 的冗余备份子卷 (all 模式下利用 snapper 命令清空快照但保留 before 节点)
 
 set -euo pipefail
-#export SHELL="$(command -v bash || echo /bin/bash)"
 
 # ===============================================================
 # Arch Linux System Cleanup Assistant (Best Version)
@@ -295,13 +294,15 @@ if command -v flatpak >/dev/null 2>&1; then
   _success "${MSG[FLATPAK_DONE]}"
 fi
 
-# [7] Screenshots & wf-recorder
+# [7] Screenshots, wf-recorder & shorin-screenrec
 _info "${MSG[STEP_MEDIA]}"
 SCREENSHOTS_DIR="$HOME/Pictures/Screenshots"
 RECORDS_DIR="$HOME/Videos/wf-recorder"
+SHORIN_RECORDS_DIR="$HOME/Videos/shorin-screenrec"
 
 [[ -d "$SCREENSHOTS_DIR" ]] && find "$SCREENSHOTS_DIR" -mindepth 1 -delete 2>/dev/null || true
 [[ -d "$RECORDS_DIR" ]] && find "$RECORDS_DIR" -mindepth 1 -delete 2>/dev/null || true
+[[ -d "$SHORIN_RECORDS_DIR" ]] && find "$SHORIN_RECORDS_DIR" -mindepth 1 -delete 2>/dev/null || true
 _success "${MSG[MEDIA_DONE]}"
 
 # [8] Btrfs Snapshots & Backup Subvolumes
