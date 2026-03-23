@@ -11,7 +11,8 @@ show_help() {
     echo "  -h, --help    Show this help message and exit."
     echo ""
     echo "Theme Directory:"
-    echo "  Local themes are automatically scanned from: /boot/grub/themes/"
+    # 【修改点 1】更新帮助文档的路径指示
+    echo "  Local themes are automatically scanned from: /usr/share/grub/themes/"
     echo "  To add a custom theme, place its folder (which must contain a 'theme.txt' file)"
     echo "  into this directory. It will then automatically appear in the selection menu."
     echo ""
@@ -61,7 +62,8 @@ cleanup_minegrub() {
     [ "$minegrub_found" == "true" ] && log "Minegrub double-menu configuration completely removed."
 }
 
-DEST_DIR="/boot/grub/themes"
+# 【修改点 2】更改核心扫描路径到天然兼容 Btrfs 的 /usr/share/grub/themes
+DEST_DIR="/usr/share/grub/themes"
 THEME_PATHS=()
 THEME_NAMES=()
 
