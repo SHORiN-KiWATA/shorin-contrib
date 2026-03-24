@@ -343,16 +343,26 @@ _pick_menu_backend() {
     return
   fi
 
-  # [智能上下文探测 Context-Aware Detection]
+  # [智能上下文探测 v2.0]
+  # 区分真正的图形终端模拟器 (/dev/pts/*) 和被 Hyprland 意外继承的底层控制台 (/dev/tty*)
+  local is_real_terminal=false
   if [[ -t 0 ]]; then
-    # 1. 终端环境 (TTY)：如果装了 fzf 则使用极客最爱的 fzf，否则使用最纯粹的数字问答 (term)
+    local current_tty
+    current_tty="$(tty 2>/dev/null || true)"
+    if [[ "$current_tty" == /dev/pts/* ]]; then
+      is_real_terminal=true
+    fi
+  fi
+
+  if [[ "$is_real_terminal" == true ]]; then
+    # 1. 真实终端环境 (Kitty/Alacritty等)：使用 fzf 或纯文本交互
     if has fzf; then 
       echo "fzf"
     else 
       echo "term"
     fi
   else
-    # 2. GUI 环境 (Waybar/快捷键后台唤醒)：按优先级寻找图形化桌面启动器
+    # 2. GUI 环境 (Hyprland 快捷键后台 / Waybar 点击)：使用图形化桌面启动器
     for b in fuzzel wofi rofi bemenu; do 
       has "$b" && { echo "$b"; return; }
     done
