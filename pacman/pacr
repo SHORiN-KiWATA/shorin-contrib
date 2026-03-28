@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Description: Pacman/AUR卸载软件的TUI
-# ==============================================================================
-# pacr - Fuzzy find and remove packages (Localized & Non-blocking)
+# Description: 卸载软件TUI（支持卸载pacman、AUR和Flatpak软件）
 # ==============================================================================
 # 启用严格的错误处理机制
 set -euo pipefail
@@ -11,6 +9,7 @@ ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
 SHOW_HELP=false
 QUERY_ARGS=()
 
+export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells)
 # 强制 C locale 确保 awk 解析的一致性
 export LC_ALL=C
 
@@ -31,34 +30,54 @@ done
 # --- 3. 本地化多语言字典 ---
 declare -A MSG
 if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
-    MSG[DESC]="模糊搜索并卸载已安装的软件包。"
+    MSG[DESC]="统一模糊搜索并卸载系统软件包 (支持 Pacman/AUR 与 Flatpak)。"
     MSG[OPTS]="选项："
     MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
     MSG[FEAT]="功能特性："
-    MSG[FEAT_1]="- 彻底卸载：递归删除依赖和配置 (-Rns)"
-    MSG[FEAT_2]="- 精准追溯：动态比对显示包的真实来源 (core/extra/archlinuxcn 等)"
-    MSG[FEAT_3]="- 视觉区分：蓝色(软件源) 紫色(AUR/本地)"
+    MSG[FEAT_1]="- 大一统架构：同屏混合显示并多选 Native 包与 Flatpak 应用"
+    MSG[FEAT_2]="- 彻底与安全：Pacman 递归删除配置 (-Rns)，Flatpak 原生防误删保护"
+    MSG[FEAT_3]="- 视觉标识：蓝色(官方源) | 紫色(AUR) | 青色(Flatpak)"
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
-    MSG[REMOVING]=">> 准备卸载："
+    MSG[REMOVING_PAC]=">> 准备卸载 (Pacman/AUR)："
+    MSG[REMOVING_FPK]=">> 准备卸载 (Flatpak)："
     MSG[HEADER]="Tab:多选 | Enter:卸载 | Esc:退出"
 else
-    MSG[DESC]="Fuzzy search & remove installed packages."
+    MSG[DESC]="Unified fuzzy search & remove for system packages (Pacman/AUR & Flatpak)."
     MSG[OPTS]="Options:"
     MSG[OPT_HELP]="  --help, -h    Show this help and exit"
     MSG[FEAT]="Features:"
-    MSG[FEAT_1]="- Clean Remove: Recursive w/ configs (-Rns)"
-    MSG[FEAT_2]="- Exact Origin: Dynamically maps package to real repo (core/extra etc.)"
-    MSG[FEAT_3]="- Visuals: Blue(Repo) Purple(AUR/Local)"
+    MSG[FEAT_1]="- Unified UI: Mix, multi-select and remove Native & Flatpak apps together"
+    MSG[FEAT_2]="- Safe & Clean: Pacman recursive remove (-Rns), Flatpak native protection"
+    MSG[FEAT_3]="- Visuals: Blue(Repo) | Purple(AUR) | Cyan(Flatpak)"
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
-    MSG[REMOVING]=">> Preparing to remove:"
+    MSG[REMOVING_PAC]=">> Preparing to remove (Pacman/AUR):"
+    MSG[REMOVING_FPK]=">> Preparing to remove (Flatpak):"
     MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Esc:Exit"
 fi
 
-# --- 4. 帮助信息拦截 ---
+# --- 4. 核心依赖检查与动态 Helper 探测 ---
+command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
+
+AUR_HELPER=""
+if command -v paru >/dev/null 2>&1; then
+    AUR_HELPER="paru"
+elif command -v yay >/dev/null 2>&1; then
+    AUR_HELPER="yay"
+else
+    echo "${MSG[ERR_HELPER]}" >&2
+    exit 1
+fi
+
+HAS_FLATPAK=false
+if command -v flatpak >/dev/null 2>&1; then
+    HAS_FLATPAK=true
+fi
+
+# --- 5. 帮助信息拦截 ---
 if [ "$SHOW_HELP" = true ]; then
     cat <<EOF
 Usage: ${0##*/} [options] [query]
@@ -75,32 +94,17 @@ ${MSG[FEAT]}
   ${MSG[FEAT_3]}
 
 ${MSG[EX]}
-  ${0##*/} firefox        # 搜索并卸载 'firefox'
+  ${0##*/} firefox        # 搜索并卸载 'firefox' (无缝跨越两端)
   ${0##*/}                # 列出所有已安装的包
 EOF
     exit 0
 fi
 
-# --- 5. 核心依赖检查与动态 Helper 探测 ---
-command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
-
-AUR_HELPER=""
-if command -v paru >/dev/null 2>&1; then
-    AUR_HELPER="paru"
-elif command -v yay >/dev/null 2>&1; then
-    AUR_HELPER="yay"
-else
-    echo "${MSG[ERR_HELPER]}" >&2
-    exit 1
-fi
-
 # --- 6. 异步逻辑与文件安全设置 ---
-TMP_DIR=$(mktemp -d -t pacr_fzf.XXXXXX)
+TMP_DIR=$(mktemp -d -t unified_pacr.XXXXXX)
 TARGET_FILE="${TMP_DIR}/target"
 PIPE_FIFO="${TMP_DIR}/fifo"
 mkfifo "$PIPE_FIFO"
-
-PREVIEW_CMD="$AUR_HELPER -Qi {2}"
 
 cleanup() {
     if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
@@ -108,46 +112,69 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# --- 7. 数据生成器 (后台运行：智能源映射) ---
-# 提取为独立变量，避免嵌套导致单引号截断或转义错误
-AWK_CMD='
-    # 阶段 1: 读取 sync_db.txt，将源名称存入内存哈希表
+# --- 7. 数据生成器 (后台运行：双轨并行) ---
+# Pacman AWK：打上 "PKG:" 前缀
+AWK_CMD_PACMAN='
     NR==FNR {
-        if (!($2 in repo)) {
-            repo[$2] = $1
-        }
+        if (!($2 in repo)) { repo[$2] = $1 }
         next
     }
-    # 阶段 2: 读取 pacman -Q 当前已安装的包
     {
-        pkg_name = $1
-        pkg_ver = $2
+        pkg_name = $1; pkg_ver = $2
         if (pkg_name in repo) {
-            # 存在于源中 -> 官方源或第三方源 (蓝色)
-            printf "%s%-16s%s %-30s %s\n", cb, repo[pkg_name], r, pkg_name, pkg_ver
+            printf "PKG: %s%-16s%s %-35s %s\n", cb, repo[pkg_name], r, pkg_name, pkg_ver
         } else {
-            # 不存在于源中 -> 纯正的外来/AUR包 (紫色)
-            printf "%s%-16s%s %-30s %s\n", cp, "aur", r, pkg_name, pkg_ver
+            printf "PKG: %s%-16s%s %-35s %s\n", cp, "aur/local", r, pkg_name, pkg_ver
         }
     }
 '
 
+# Flatpak AWK：打上 "FLTK:" 前缀
+AWK_CMD_FLATPAK='
+    {
+        if (NF < 3) next
+        origin = $1; app_id = $NF
+        $1=""; $NF=""; name=$0
+        sub(/^[ \t]+/, "", name); sub(/[ \t]+$/, "", name)
+        printf "FLTK: %s%-16s%s %-35s %s\n", cc, origin, r, name, app_id
+    }
+'
+
 (
-    # 导出包含 repo 信息的源数据库清单 (输出格式: repo pkgname pkgver)
-    pacman --color=never -Sl > "${TMP_DIR}/sync_db.txt" || true
-
-    # 比对本地已安装包，精确追溯来源
+    # 任务1：生成 Pacman 数据
+    pacman --color=never -Sl > "${TMP_DIR}/sync_db.txt" 2>/dev/null || true
     pacman --color=never -Q | awk -v cb='\033[34m' -v cp='\033[35m' -v r='\033[0m' \
-        "$AWK_CMD" "${TMP_DIR}/sync_db.txt" -
+        "$AWK_CMD_PACMAN" "${TMP_DIR}/sync_db.txt" -
 
+    # 任务2：生成 Flatpak 数据 (如果存在)
+    if [ "$HAS_FLATPAK" = true ]; then
+        flatpak list --app --columns=origin,name,application 2>/dev/null | \
+        awk -v cc='\033[36m' -v r='\033[0m' "$AWK_CMD_FLATPAK" || true
+    fi
 ) > "$PIPE_FIFO" 2>/dev/null &
 
 PID_GEN=$!
 
-# --- 8. 交互式 FZF 渲染 ---
+# --- 8. 交互式 FZF 渲染与智能预览 ---
+# FZF 内联预览脚本：识别第一列的隐藏前缀，分发给不同的包管理器处理
+PREVIEW_CMD="
+line={}
+if [[ \"\$line\" == PKG:* ]]; then
+    pkg=\$(echo \"\$line\" | awk '{print \$3}')
+    ${AUR_HELPER} -Qi \"\$pkg\"
+elif [[ \"\$line\" == FLTK:* ]]; then
+    appid=\$(echo \"\$line\" | awk '{print \$NF}')
+    flatpak info \"\$appid\"
+fi
+"
+
 COLOR_YELLOW=$'\033[33m'
+COLOR_CYAN=$'\033[36m'
 COLOR_RESET=$'\033[0m'
-FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}${AUR_HELPER}${COLOR_RESET}"
+if [ "$HAS_FLATPAK" = true ]; then
+    FZF_HEADER+=" & ${COLOR_CYAN}Flatpak${COLOR_RESET}"
+fi
 
 set +e
 fzf --multi --ansi \
@@ -156,7 +183,8 @@ fzf --multi --ansi \
     --height=95% --layout=reverse --border \
     --bind "alt-j:last,alt-k:first" \
     --tiebreak=index \
-    --nth=2 \
+    --with-nth=2.. \
+    --nth=3.. \
     --header "$FZF_HEADER" \
     --query "${QUERY_ARGS[*]:-}" \
     < "$PIPE_FIFO" \
@@ -164,19 +192,36 @@ fzf --multi --ansi \
 FZF_EXIT=$?
 set -e
 
-# --- 9. 执行卸载 ---
+# --- 9. 执行卸载逻辑 (分发处理) ---
 if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     mapfile -t SELECTED_LINES < "$TARGET_FILE"
-    PACKAGES=()
+    PAC_PKGS=()
+    FPK_PKGS=()
+    
+    # 拆分选中的项目
     for line in "${SELECTED_LINES[@]}"; do
-        pkg=$(echo "$line" | awk '{print $2}')
-        [[ -n "$pkg" ]] && PACKAGES+=("$pkg")
+        if [[ "$line" == PKG:* ]]; then
+            pkg=$(echo "$line" | awk '{print $3}')
+            [[ -n "$pkg" ]] && PAC_PKGS+=("$pkg")
+        elif [[ "$line" == FLTK:* ]]; then
+            appid=$(echo "$line" | awk '{print $NF}')
+            [[ -n "$appid" ]] && FPK_PKGS+=("$appid")
+        fi
     done
     
-    if [[ ${#PACKAGES[@]} -gt 0 ]]; then
-        echo -e "\n\033[34m${MSG[REMOVING]}\033[0m"
-        echo "${PACKAGES[*]}"
+    # 执行 Pacman/AUR 卸载
+    if [[ ${#PAC_PKGS[@]} -gt 0 ]]; then
+        echo -e "\n\033[34m${MSG[REMOVING_PAC]}\033[0m"
+        echo "${PAC_PKGS[*]}"
         echo "----------------------------------------"
-        "$AUR_HELPER" -Rns "${PACKAGES[@]}"
+        "$AUR_HELPER" -Rns "${PAC_PKGS[@]}"
+    fi
+
+    # 执行 Flatpak 卸载
+    if [[ ${#FPK_PKGS[@]} -gt 0 ]]; then
+        echo -e "\n\033[36m${MSG[REMOVING_FPK]}\033[0m"
+        echo "${FPK_PKGS[*]}"
+        echo "----------------------------------------"
+        flatpak uninstall "${FPK_PKGS[@]}"
     fi
 fi
