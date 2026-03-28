@@ -4,14 +4,57 @@
 # 启用严格的错误处理机制
 set -euo pipefail
 
-# --- 1. 环境与基础配置 ---
+# 记录初始语言环境，并强制 C locale 确保 awk 解析的一致性
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
+export LC_ALL=C
+
+# --- 0. 内部生成器拦截 (由 fzf reload 或后台进程触发) ---
+if [[ "${1:-}" == "--generate-list" ]]; then
+    FORCE_REFRESH="$2"
+    INSTALLED_LIST="$3"
+    AUR_CACHE="$4"
+    AUR_FILTER="$5"
+    MSG_INSTALLED="$6"
+    CACHE_TIME=3600
+
+    AWK_CMD='
+        FNR==NR { installed[$1]=1; next }
+        {
+            status = ($2 in installed) ? ci " ✔ " label r : ""
+            printf "%s%-10s%s %-30s %-20s %s\n", c, $1, r, $2, $3, status
+        }
+    '
+
+    # 动态获取并刷新本地已安装包的状态列表
+    pacman -Qq > "$INSTALLED_LIST" || true
+
+    # 1. 官方源数据
+    pacman -Sl | awk -v c='\033[34m' -v ci='\033[32m' -v r='\033[0m' \
+        -v label="$MSG_INSTALLED" \
+        "$AWK_CMD" "$INSTALLED_LIST" -
+
+    # 2. AUR 数据 (根据条件判定是否拉取远程压缩包)
+    if [[ "$FORCE_REFRESH" == true ]] || [[ ! -f "$AUR_CACHE" ]] || [[ $(find "$AUR_CACHE" -mmin +$((CACHE_TIME / 60)) 2>/dev/null) ]]; then
+        curl -sL https://aur.archlinux.org/packages.gz | zcat > "$AUR_CACHE" || true
+    fi
+
+    if [[ -s "$AUR_CACHE" ]]; then
+        grep -vE "$AUR_FILTER" "$AUR_CACHE" 2>/dev/null | \
+        awk '{print "aur", $1, "-"}' | \
+        awk -v c='\033[35m' -v ci='\033[32m' -v r='\033[0m' \
+            -v label="$MSG_INSTALLED" \
+            "$AWK_CMD" "$INSTALLED_LIST" -
+    fi
+    exit 0
+fi
+
+# --- 1. 环境与基础配置 ---
 SHOW_HELP=false
 FORCE_REFRESH=false
 QUERY_ARGS=()
 
-# 强制 C locale 确保 awk 解析的一致性
-export LC_ALL=C
+# 获取脚本自身的绝对路径，确保在 fzf 子进程 reload 时能准确自我调用
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
 
 # --- 2. 参数解析 ---
 while [[ $# -gt 0 ]]; do
@@ -43,12 +86,13 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[FEAT_1]="- 准确状态：显示 [已安装] 标记"
     MSG[FEAT_2]="- 视觉区分：蓝色(官方) 紫色(AUR)"
     MSG[FEAT_3]="- 智能降级：自动探测使用 paru 或 yay"
+    MSG[FEAT_4]="- 快捷刷新：fzf 界面内按 Ctrl+R 强制重载并拉取最新缓存"
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
     MSG[INSTALLED]="[已安装]"
     MSG[INSTALLING]=">> 准备安装："
-    MSG[HEADER]="Tab:多选 | Enter:安装 | Esc:退出"
+    MSG[HEADER]="Tab:多选 | Enter:安装 | Ctrl+R:强制刷新 | Esc:退出"
 else
     MSG[DESC]="Fuzzy search & install packages (Repo + AUR)."
     MSG[OPTS]="Options:"
@@ -58,15 +102,17 @@ else
     MSG[FEAT_1]="- Accurate status: [Installed] tag"
     MSG[FEAT_2]="- Visuals: Blue(Repo) Purple(AUR)"
     MSG[FEAT_3]="- Smart Fallback: Auto-detects paru or yay"
+    MSG[FEAT_4]="- Quick Refresh: Press Ctrl+R in TUI to force refresh"
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
     MSG[INSTALLED]="[Installed]"
     MSG[INSTALLING]=">> Installing:"
-    MSG[HEADER]="Tab:Multi-Select | Enter:Install | Esc:Exit"
+    MSG[HEADER]="Tab:Multi-Select | Enter:Install | Ctrl+R:Force Refresh | Esc:Exit"
 fi
 
 # --- 4. 帮助信息拦截 ---
+# 修复：if 和 [ 之间必须有空格
 if [ "$SHOW_HELP" = true ]; then
     cat <<EOF
 Usage: ${0##*/} [options] [query]
@@ -82,6 +128,7 @@ ${MSG[FEAT]}
   ${MSG[FEAT_1]}
   ${MSG[FEAT_2]}
   ${MSG[FEAT_3]}
+  ${MSG[FEAT_4]}
 
 ${MSG[EX]}
   ${0##*/} firefox        # 搜索 'firefox'
@@ -115,12 +162,8 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pac_tui"
 mkdir -p "$CACHE_DIR"
 
 AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
-CACHE_TIME=3600 # 缓存过期时间 (秒)
-
 AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
 PREVIEW_CMD="$AUR_HELPER -Si {2}"
-
-pacman -Qq > "$INSTALLED_LIST" || true
 
 cleanup() {
     if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
@@ -129,41 +172,17 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- 7. 数据生成器 (后台运行) ---
-AWK_CMD='
-    FNR==NR { installed[$1]=1; next }
-    {
-        status = ($2 in installed) ? ci " ✔ " label r : ""
-        printf "%s%-10s%s %-30s %-20s %s\n", c, $1, r, $2, $3, status
-    }
-'
-
-(
-    # 1. 官方源数据
-    pacman -Sl | awk -v c='\033[34m' -v ci='\033[32m' -v r='\033[0m' \
-        -v label="${MSG[INSTALLED]}" \
-        "$AWK_CMD" "$INSTALLED_LIST" -
-
-    # 2. AUR 数据
-    if [[ "$FORCE_REFRESH" == true ]] || [[ ! -f "$AUR_CACHE" ]] || [[ $(find "$AUR_CACHE" -mmin +$((CACHE_TIME / 60)) 2>/dev/null) ]]; then
-        curl -sL https://aur.archlinux.org/packages.gz | zcat > "$AUR_CACHE" || true
-    fi
-
-    if [[ -s "$AUR_CACHE" ]]; then
-        grep -vE "$AUR_FILTER" "$AUR_CACHE" 2>/dev/null | \
-        awk '{print "aur", $1, "-"}' | \
-        awk -v c='\033[35m' -v ci='\033[32m' -v r='\033[0m' \
-            -v label="${MSG[INSTALLED]}" \
-            "$AWK_CMD" "$INSTALLED_LIST" -
-    fi
-) > "$PIPE_FIFO" 2>/dev/null &
-
+# 利用内部自调用作为守护进程生成初始列表
+"$SCRIPT_PATH" --generate-list "$FORCE_REFRESH" "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "${MSG[INSTALLED]}" > "$PIPE_FIFO" 2>/dev/null &
 PID_GEN=$!
 
 # --- 8. 交互式 FZF 渲染 ---
-# 使用 ANSI-C 引用的方式将真实的颜色字节注入变量
 COLOR_YELLOW=$'\033[33m'
 COLOR_RESET=$'\033[0m'
 FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+
+# 构造安全的 reload 命令（利用 printf 转义变量，防止路径中包含空格等字符导致执行崩溃）
+RELOAD_CMD=$(printf "%q " "$SCRIPT_PATH" --generate-list true "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "${MSG[INSTALLED]}")
 
 set +e
 fzf --multi --ansi \
@@ -171,6 +190,7 @@ fzf --multi --ansi \
     --preview-window=down:55%:wrap \
     --height=95% --layout=reverse --border \
     --bind "alt-j:last,alt-k:first" \
+    --bind "ctrl-r:reload($RELOAD_CMD)" \
     --tiebreak=index \
     --nth=2 \
     --header "$FZF_HEADER" \
