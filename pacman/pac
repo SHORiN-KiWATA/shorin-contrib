@@ -170,6 +170,7 @@ fzf --multi --ansi \
     --preview "$PREVIEW_CMD" \
     --preview-window=down:55%:wrap \
     --height=95% --layout=reverse --border \
+    --bind "alt-j:last,alt-k:first" \
     --tiebreak=index \
     --nth=2 \
     --header "$FZF_HEADER" \

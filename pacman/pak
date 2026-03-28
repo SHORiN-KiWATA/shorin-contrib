@@ -190,6 +190,7 @@ fzf --multi --ansi \
     --preview-window=down:55%:wrap \
     --height=95% --layout=reverse --border \
     --tiebreak=index \
+    --bind "alt-j:last,alt-k:first" \
     --nth=2.. \
     --header "$FZF_HEADER" \
     --query "${QUERY_ARGS[*]:-}" \
