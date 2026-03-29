@@ -4,30 +4,63 @@
 # 启用严格的错误处理机制
 set -euo pipefail
 
-# --- 1. 环境与基础配置 ---
+# 获取脚本自身的绝对路径，确保 reload 动作在任何路径下都能正确调用自身
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells || echo "/bin/bash")
+
+# --- 1. 隐藏的内部调用：用于双轨并行生成/刷新数据 ---
+if [[ "${1:-}" == "--generate-data" ]]; then
+    AWK_CMD_PACMAN='
+        NR==FNR {
+            if (!($2 in repo)) { repo[$2] = $1 }
+            next
+        }
+        {
+            pkg_name = $1; pkg_ver = $2
+            rname = (pkg_name in repo) ? repo[pkg_name] : "aur"
+            color = (pkg_name in repo) ? cb : cp
+            
+            # 【修复点1】先打印带有颜色的来源，紧接着打印重置符 \033[0m
+            printf "PKG: %s%s%s", color, rname, r
+            
+            # 【修复点2】将用于对齐的空格垫在重置符之后，确保 awk 切分字段不会把 \033[0m 算作独立字段
+            for(i=length(rname); i<16; i++) printf " "
+            
+            printf " %-35s %s\n", pkg_name, pkg_ver
+        }
+    '
+
+    AWK_CMD_FLATPAK='
+        {
+            if (NF < 3) next
+            app_id = $1; origin = $2
+            $1=""; $2=""; name=$0
+            sub(/^[ \t]+/, "", name); sub(/[ \t]+$/, "", name)
+            
+            # 同理，处理 Flatpak 的对齐与空格
+            printf "FLTK: %s%s%s", cc, origin, r
+            for(i=length(origin); i<16; i++) printf " "
+            printf " %-35s %s\n", name, app_id
+        }
+    '
+
+    # 生成 Pacman 数据
+    awk -v cb='\033[34m' -v cp='\033[35m' -v r='\033[0m' \
+        "$AWK_CMD_PACMAN" <(pacman --color=never -Sl 2>/dev/null || true) <(pacman --color=never -Q)
+
+    # 生成 Flatpak 数据 (如果存在)
+    if command -v flatpak >/dev/null 2>&1; then
+        flatpak list --app --columns=application,origin,name 2>/dev/null | \
+        awk -v cc='\033[36m' -v r='\033[0m' "$AWK_CMD_FLATPAK" || true
+    fi
+    exit 0
+fi
+
+# --- 2. 环境与多语言字典配置 ---
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
 SHOW_HELP=false
 QUERY_ARGS=()
 
-export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells)
-# 强制 C locale 确保 awk 解析的一致性
-export LC_ALL=C
-
-# --- 2. 参数解析 ---
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --help|-h)
-            SHOW_HELP=true
-            shift
-            ;;
-        *)
-            QUERY_ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-
-# --- 3. 本地化多语言字典 ---
 declare -A MSG
 if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[DESC]="统一模糊搜索并卸载系统软件包 (支持 Pacman/AUR 与 Flatpak)。"
@@ -42,7 +75,7 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
     MSG[REMOVING_PAC]=">> 准备卸载 (Pacman/AUR)："
     MSG[REMOVING_FPK]=">> 准备卸载 (Flatpak)："
-    MSG[HEADER]="Tab:多选 | Enter:卸载 | Esc:退出"
+    MSG[HEADER]="Tab:多选 | Enter:卸载 | Ctrl+R:刷新 | Esc:退出"
 else
     MSG[DESC]="Unified fuzzy search & remove for system packages (Pacman/AUR & Flatpak)."
     MSG[OPTS]="Options:"
@@ -56,8 +89,22 @@ else
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
     MSG[REMOVING_PAC]=">> Preparing to remove (Pacman/AUR):"
     MSG[REMOVING_FPK]=">> Preparing to remove (Flatpak):"
-    MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Esc:Exit"
+    MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Ctrl+R:Reload | Esc:Exit"
 fi
+
+# --- 3. 参数解析 ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            SHOW_HELP=true
+            shift
+            ;;
+        *)
+            QUERY_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
 
 # --- 4. 核心依赖检查与动态 Helper 探测 ---
 command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
@@ -100,63 +147,17 @@ EOF
     exit 0
 fi
 
-# --- 6. 异步逻辑与文件安全设置 ---
+# --- 6. 文件安全设置 ---
 TMP_DIR=$(mktemp -d -t unified_pacr.XXXXXX)
 TARGET_FILE="${TMP_DIR}/target"
-PIPE_FIFO="${TMP_DIR}/fifo"
-mkfifo "$PIPE_FIFO"
 
 cleanup() {
-    if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
-# --- 7. 数据生成器 (后台运行：双轨并行) ---
-# Pacman AWK：打上 "PKG:" 前缀
-AWK_CMD_PACMAN='
-    NR==FNR {
-        if (!($2 in repo)) { repo[$2] = $1 }
-        next
-    }
-    {
-        pkg_name = $1; pkg_ver = $2
-        if (pkg_name in repo) {
-            printf "PKG: %s%-16s%s %-35s %s\n", cb, repo[pkg_name], r, pkg_name, pkg_ver
-        } else {
-            printf "PKG: %s%-16s%s %-35s %s\n", cp, "aur/local", r, pkg_name, pkg_ver
-        }
-    }
-'
-
-# Flatpak AWK：打上 "FLTK:" 前缀
-AWK_CMD_FLATPAK='
-    {
-        if (NF < 3) next
-        origin = $1; app_id = $NF
-        $1=""; $NF=""; name=$0
-        sub(/^[ \t]+/, "", name); sub(/[ \t]+$/, "", name)
-        printf "FLTK: %s%-16s%s %-35s %s\n", cc, origin, r, name, app_id
-    }
-'
-
-(
-    # 任务1：生成 Pacman 数据
-    pacman --color=never -Sl > "${TMP_DIR}/sync_db.txt" 2>/dev/null || true
-    pacman --color=never -Q | awk -v cb='\033[34m' -v cp='\033[35m' -v r='\033[0m' \
-        "$AWK_CMD_PACMAN" "${TMP_DIR}/sync_db.txt" -
-
-    # 任务2：生成 Flatpak 数据 (如果存在)
-    if [ "$HAS_FLATPAK" = true ]; then
-        flatpak list --app --columns=origin,name,application 2>/dev/null | \
-        awk -v cc='\033[36m' -v r='\033[0m' "$AWK_CMD_FLATPAK" || true
-    fi
-) > "$PIPE_FIFO" 2>/dev/null &
-
-PID_GEN=$!
-
-# --- 8. 交互式 FZF 渲染与智能预览 ---
-# FZF 内联预览脚本：识别第一列的隐藏前缀，分发给不同的包管理器处理
+# --- 7. 交互式 FZF 渲染与智能预览 ---
+# 这里 $3 能精准提取包名，不再被颜色符干扰
 PREVIEW_CMD="
 line={}
 if [[ \"\$line\" == PKG:* ]]; then
@@ -177,22 +178,23 @@ if [ "$HAS_FLATPAK" = true ]; then
 fi
 
 set +e
+# 【修复点3】去掉了 --nth=3.. 解锁全部字段搜索，支持搜索软件名、仓库名(aur/flathub) 和 版本号
 fzf --multi --ansi \
     --preview "$PREVIEW_CMD" \
     --preview-window=down:55%:wrap \
     --height=95% --layout=reverse --border \
     --bind "alt-j:last,alt-k:first" \
+    --bind "ctrl-r:reload(\"$SCRIPT_PATH\" --generate-data)" \
     --tiebreak=index \
     --with-nth=2.. \
-    --nth=3.. \
     --header "$FZF_HEADER" \
     --query "${QUERY_ARGS[*]:-}" \
-    < "$PIPE_FIFO" \
+    < <("$SCRIPT_PATH" --generate-data) \
     > "$TARGET_FILE"
 FZF_EXIT=$?
 set -e
 
-# --- 9. 执行卸载逻辑 (分发处理) ---
+# --- 8. 执行卸载逻辑 (分发处理) ---
 if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     mapfile -t SELECTED_LINES < "$TARGET_FILE"
     PAC_PKGS=()
