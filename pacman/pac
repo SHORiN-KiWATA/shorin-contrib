@@ -25,19 +25,35 @@ if [[ "${1:-}" == "--generate-list" ]]; then
         }
     '
 
-    # 动态获取并刷新本地已安装包的状态列表
+    # 1. 优先输出本地已安装包的状态列表（确保界面立刻有反应）
     pacman -Qq > "$INSTALLED_LIST" || true
 
-    # 1. 官方源数据
+    # 2. 官方源数据
     pacman -Sl | awk -v c='\033[34m' -v ci='\033[32m' -v r='\033[0m' \
         -v label="$MSG_INSTALLED" \
         "$AWK_CMD" "$INSTALLED_LIST" -
 
-    # 2. AUR 数据 (根据条件判定是否拉取远程压缩包)
-    if [[ "$FORCE_REFRESH" == true ]] || [[ ! -f "$AUR_CACHE" ]] || [[ $(find "$AUR_CACHE" -mmin +$((CACHE_TIME / 60)) 2>/dev/null) ]]; then
-        curl -sL https://aur.archlinux.org/packages.gz | zcat > "$AUR_CACHE" || true
+    # 3. AUR 数据逻辑优化
+    # 判定是否需要刷新：强制刷新 OR 文件不存在 OR 文件过期
+    NEED_UPDATE=false
+    if [[ "$FORCE_REFRESH" == true ]] || [[ ! -s "$AUR_CACHE" ]]; then
+        NEED_UPDATE=true
+    elif [[ $(find "$AUR_CACHE" -mmin +$((CACHE_TIME / 60)) 2>/dev/null) ]]; then
+        NEED_UPDATE=true
     fi
 
+    if [[ "$NEED_UPDATE" == true ]]; then
+        # 核心改进：先下载到临时文件，避免直接重定向清空旧缓存
+        TEMP_AUR="${AUR_CACHE}.tmp"
+        if curl -sLf --connect-timeout 5 https://aur.archlinux.org/packages.gz | zcat > "$TEMP_AUR" 2>/dev/null; then
+            mv "$TEMP_AUR" "$AUR_CACHE"
+        else
+            rm -f "$TEMP_AUR"
+            # 下载失败了，如果旧缓存存在，就凑合着用，总比没有强
+        fi
+    fi
+
+    # 只要缓存文件大于 0，就显示它
     if [[ -s "$AUR_CACHE" ]]; then
         grep -vE "$AUR_FILTER" "$AUR_CACHE" 2>/dev/null | \
         awk '{print "aur", $1, "-"}' | \
