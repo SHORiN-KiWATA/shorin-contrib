@@ -21,7 +21,15 @@ if [[ "${1:-}" == "--generate-list" ]]; then
         FNR==NR { installed[$1]=1; next }
         {
             status = ($2 in installed) ? ci " ✔ " label r : ""
-            printf "%s%-10s%s %-30s %-20s %s\n", c, $1, r, $2, $3, status
+            
+            # 先打印带有颜色的源，紧接着打印重置符 \033[0m
+            printf "%s%s%s", c, $1, r
+            
+            # 【修复】：将对齐宽度从 11 调大到 16，确保足以容纳 "archlinuxcn" 等较长源名并留出空格
+            for(i=length($1); i<16; i++) printf " "
+            
+            # 【修复】：将包名的占位从 %-30s 增大到 %-35s，让排版更宽松
+            printf "%-35s %-20s %s\n", $2, $3, status
         }
     '
 
@@ -103,6 +111,7 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[FEAT_2]="- 视觉区分：蓝色(官方) 紫色(AUR)"
     MSG[FEAT_3]="- 智能降级：自动探测使用 paru 或 yay"
     MSG[FEAT_4]="- 快捷刷新：fzf 界面内按 Ctrl+R 强制重载并拉取最新缓存"
+    MSG[FEAT_5]="- 灵活搜索：支持搜索来源标签 (如 aur, extra) 以及版本号等"
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
@@ -119,6 +128,7 @@ else
     MSG[FEAT_2]="- Visuals: Blue(Repo) Purple(AUR)"
     MSG[FEAT_3]="- Smart Fallback: Auto-detects paru or yay"
     MSG[FEAT_4]="- Quick Refresh: Press Ctrl+R in TUI to force refresh"
+    MSG[FEAT_5]="- Flexible Search: Searchable by repo tags (e.g., aur, core) and versions"
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
@@ -128,7 +138,6 @@ else
 fi
 
 # --- 4. 帮助信息拦截 ---
-# 修复：if 和 [ 之间必须有空格
 if [ "$SHOW_HELP" = true ]; then
     cat <<EOF
 Usage: ${0##*/} [options] [query]
@@ -145,6 +154,7 @@ ${MSG[FEAT]}
   ${MSG[FEAT_2]}
   ${MSG[FEAT_3]}
   ${MSG[FEAT_4]}
+  ${MSG[FEAT_5]}
 
 ${MSG[EX]}
   ${0##*/} firefox        # 搜索 'firefox'
@@ -208,7 +218,6 @@ fzf --multi --ansi \
     --bind "alt-j:last,alt-k:first" \
     --bind "ctrl-r:reload($RELOAD_CMD)" \
     --tiebreak=index \
-    --nth=2 \
     --header "$FZF_HEADER" \
     --query "${QUERY_ARGS[*]:-}" \
     < "$PIPE_FIFO" \
