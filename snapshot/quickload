@@ -51,7 +51,7 @@ if [[ "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" =~ zh_CN ]]; then
     MSG_RESTORE_DOING=">>> 正在静默执行回档项 ID: %s ...\n"
     
     MSG_NOTIFY_SUCC_TITLE="回档设定成功"
-    MSG_NOTIFY_SUCC_BODY="快照恢复任务已下发。\n请立即重启系统以生效。"
+    MSG_NOTIFY_SUCC_BODY="快照恢复任务已下发。\n系统即将自动重启..."
     MSG_NOTIFY_ERR_TITLE="回档操作失败"
 else
     MSG_HELP_DESC="Quickly restore Btrfs snapshots. Supports both normal system and snapshot boot."
@@ -96,7 +96,7 @@ else
     MSG_RESTORE_DOING=">>> Executing restore ID: %s silently...\n"
     
     MSG_NOTIFY_SUCC_TITLE="Restore Configured"
-    MSG_NOTIFY_SUCC_BODY="Snapshot restore task is scheduled.\nPlease REBOOT immediately to apply."
+    MSG_NOTIFY_SUCC_BODY="Snapshot restore task is scheduled.\nSystem will reboot automatically..."
     MSG_NOTIFY_ERR_TITLE="Restore Failed"
 fi
 
@@ -469,6 +469,8 @@ execute_restore() {
     done
     
     notify_ok "======================================\n$MSG_NOTIFY_SUCC_BODY\n======================================"
+    sleep 3 
+    reboot
 }
 
 if [[ $OPT_NOCONFIRM -eq 1 || -n "$OPT_CONFIG" ]]; then
