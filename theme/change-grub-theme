@@ -167,5 +167,5 @@ else
 fi
 
 log "Regenerating GRUB configuration..."
-exe grub-mkconfig -o /boot/grub/grub.cfg
+exe LANG=en_US.UTF-8 LANGUAGE=en_US.UTF-8 grub-mkconfig -o /boot/grub/grub.cfg
 success "All done!"
