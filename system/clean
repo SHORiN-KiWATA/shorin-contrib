@@ -298,7 +298,7 @@ fi
 _info "${MSG[STEP_MEDIA]}"
 SCREENSHOTS_DIR="$HOME/Pictures/Screenshots"
 RECORDS_DIR="$HOME/Videos/wf-recorder"
-SHORIN_RECORDS_DIR="$HOME/Videos/shorin-screenrec"
+SHORIN_RECORDS_DIR="$HOME/Videos/shorin-screenrec-menu"
 
 [[ -d "$SCREENSHOTS_DIR" ]] && find "$SCREENSHOTS_DIR" -mindepth 1 -delete 2>/dev/null || true
 [[ -d "$RECORDS_DIR" ]] && find "$RECORDS_DIR" -mindepth 1 -delete 2>/dev/null || true
