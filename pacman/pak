@@ -182,7 +182,7 @@ COLOR_CYAN=$'\033[36m'
 COLOR_RESET=$'\033[0m'
 FZF_HEADER="${MSG[HEADER]} | ${COLOR_CYAN}Using Flatpak${COLOR_RESET}"
 
-PREVIEW_CMD="line={}; clean=\$(echo \"\$line\" | sed 's/ ✔ .*//'); o=\$(echo \"\$clean\" | awk '{print \$1}'); a=\$(echo \"\$clean\" | awk '{print \$NF}'); flatpak remote-info \"\$o\" \"\$a\""
+PREVIEW_CMD="line={}; clean=\$(echo \"\$line\" | sed 's/ ✔ .*//'); o=\$(echo \"\$clean\" | awk '{print \$1}'); a=\$(echo \"\$clean\" | awk '{print \$NF}'); LC_ALL=$ORIGINAL_LANG flatpak remote-info \"\$o\" \"\$a\""
 
 set +e
 fzf --multi --ansi \
@@ -214,6 +214,6 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
         echo "${PACKAGES[*]}"
         echo "----------------------------------------"
-        flatpak install "${PACKAGES[@]}"
+        LC_ALL="$ORIGINAL_LANG" flatpak install "${PACKAGES[@]}"
     fi
 fi

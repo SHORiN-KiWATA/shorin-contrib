@@ -189,7 +189,7 @@ mkdir -p "$CACHE_DIR"
 
 AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
 AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
-PREVIEW_CMD="$AUR_HELPER -Si {2}"
+PREVIEW_CMD="LC_ALL=$ORIGINAL_LANG $AUR_HELPER --color=always -Si {2}"
 
 cleanup() {
     if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
@@ -238,6 +238,6 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
         echo "${PACKAGES[*]}"
         echo "----------------------------------------"
-        "$AUR_HELPER" -S "${PACKAGES[@]}"
+        LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" -S "${PACKAGES[@]}"
     fi
 fi

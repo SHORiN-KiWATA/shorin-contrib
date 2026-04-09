@@ -162,7 +162,7 @@ PREVIEW_CMD="
 line={}
 if [[ \"\$line\" == PKG:* ]]; then
     pkg=\$(echo \"\$line\" | awk '{print \$3}')
-    ${AUR_HELPER} -Qi \"\$pkg\"
+    ${AUR_HELPER} --color=always -Qi \"\$pkg\"
 elif [[ \"\$line\" == FLTK:* ]]; then
     appid=\$(echo \"\$line\" | awk '{print \$NF}')
     flatpak info \"\$appid\"

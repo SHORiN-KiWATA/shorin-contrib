@@ -139,7 +139,7 @@ PIPE_FIFO="${TMP_DIR}/fifo"
 mkfifo "$PIPE_FIFO"
 
 # 预览时直接查询本地已安装信息即可
-PREVIEW_CMD="$AUR_HELPER -Qi {2}"
+PREVIEW_CMD="LC_ALL=$ORIGINAL_LANG $AUR_HELPER --color=always -Qi {2}"
 
 cleanup() {
     if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
@@ -216,6 +216,6 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         echo "----------------------------------------"
 
         # downgrade 本身会在执行 pacman -U 时自动请求 sudo 权限
-        sudo downgrade "${PACKAGES[@]}"
+        LC_ALL="$ORIGINAL_LANG" sudo downgrade "${PACKAGES[@]}"
     fi
 fi
