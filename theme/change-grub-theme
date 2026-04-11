@@ -118,7 +118,7 @@ SKIP_THEME=false
 if [ "$USER_CHOICE" -eq "$SKIP_IDX" ]; then
     SKIP_THEME=true
     info "Selected" "Clear Theme"
-elif [ "$USER_CHOICE" -eq "$MINEGRUB_IDX" ]; then
+    elif [ "$USER_CHOICE" -eq "$MINEGRUB_IDX" ]; then
     INSTALL_MINEGRUB=true
     info "Selected" "Minegrub"
 else
@@ -137,7 +137,7 @@ if [ "$SKIP_THEME" == "true" ]; then
     fi
     success "Theme cleared."
     
-elif [ "$INSTALL_MINEGRUB" == "true" ]; then
+    elif [ "$INSTALL_MINEGRUB" == "true" ]; then
     TEMP_MG_DIR=$(mktemp -d -t minegrub_install_XXXXXX)
     log "Cloning Lxtharia/double-minegrub-menu..."
     if exe git clone --depth 1 "https://github.com/Lxtharia/double-minegrub-menu.git" "$TEMP_MG_DIR"; then
@@ -153,7 +153,7 @@ else
     if [ -f "$GRUB_CONF" ]; then
         if grep -q "^GRUB_THEME=" "$GRUB_CONF"; then
             exe sed -i "s|^GRUB_THEME=.*|GRUB_THEME=\"$THEME_PATH\"|" "$GRUB_CONF"
-        elif grep -q "^#GRUB_THEME=" "$GRUB_CONF"; then
+            elif grep -q "^#GRUB_THEME=" "$GRUB_CONF"; then
             exe sed -i "s|^#GRUB_THEME=.*|GRUB_THEME=\"$THEME_PATH\"|" "$GRUB_CONF"
         else
             echo "GRUB_THEME=\"$THEME_PATH\"" >> "$GRUB_CONF"
@@ -167,5 +167,5 @@ else
 fi
 
 log "Regenerating GRUB configuration..."
-exe LANG=en_US.UTF-8 LANGUAGE=en_US.UTF-8 grub-mkconfig -o /boot/grub/grub.cfg
+exe env LANG=en_US.UTF-8 LANGUAGE=en_US.UTF-8 grub-mkconfig -o /boot/grub/grub.cfg
 success "All done!"
