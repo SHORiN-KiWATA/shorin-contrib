@@ -240,7 +240,7 @@ ORPHANS=$(pacman -Qtdq || true)
 if [[ -n "$ORPHANS" ]]; then
   _warn "${MSG[ORPHAN_FOUND]}"
   mapfile -t ORPHAN_ARR <<< "$ORPHANS"
-  $PKG_MNGR -Rns "${ORPHAN_ARR[@]}" --noconfirm
+  $PKG_MNGR -Rns "${ORPHAN_ARR[@]}"
   _success "${MSG[ORPHAN_CLEAN]}"
 else
   _success "${MSG[ORPHAN_NONE]}"
