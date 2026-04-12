@@ -74,7 +74,7 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[DESC_6]="6. 清理截图和屏幕录制文件"
   MSG[DESC_7]="7. 清理旧 Btrfs 快照与冗余备份子卷"
   
-  MSG[DESC_ALL_1]="* [ALL模式] 完全清空所有软件包缓存 (-Scc)"
+  MSG[DESC_ALL_1]="* [ALL模式] 完全清空所有软件包与 AUR 幽灵缓存"
   MSG[DESC_ALL_2]="* [ALL模式] 删除所有 Btrfs 快照 (保留 Before 节点)"
 
   MSG[ASK_CONFIRM]="是否继续执行清理？[Y/n]"
@@ -90,8 +90,8 @@ if [[ "$UI_LANG" == "zh" ]]; then
   
   MSG[STEP_CACHE]="正在清理软件包缓存..."
   MSG[CACHE_DONE]="软件包缓存已清理。"
-  MSG[STEP_CACHE_ALL]="正在完全清空所有软件包缓存 (-Scc)..."
-  MSG[CACHE_ALL_DONE]="所有软件包缓存已清空。"
+  MSG[STEP_CACHE_ALL]="正在完全清空所有软件包缓存与 AUR 源码树..."
+  MSG[CACHE_ALL_DONE]="所有软件包及 AUR 缓存已彻底清空。"
 
   MSG[STEP_BROKEN]="正在清理残留下载目录..."
   MSG[BROKEN_DONE]="残留目录已清理。"
@@ -129,7 +129,7 @@ else
   MSG[DESC_6]="6. Clean screenshots and screen records"
   MSG[DESC_7]="7. Clean old btrfs snapshots & backup subvols"
 
-  MSG[DESC_ALL_1]="* [ALL MODE] Completely clear package cache (-Scc)"
+  MSG[DESC_ALL_1]="* [ALL MODE] Completely clear ALL package and AUR ghost caches"
   MSG[DESC_ALL_2]="* [ALL MODE] Delete all btrfs snapshots (keep 'Before' nodes)"
 
   MSG[ASK_CONFIRM]="Continue with cleanup? [Y/n]"
@@ -145,8 +145,8 @@ else
   
   MSG[STEP_CACHE]="Cleaning package cache..."
   MSG[CACHE_DONE]="Package cache cleaned."
-  MSG[STEP_CACHE_ALL]="Completely cleaning package cache (-Scc)..."
-  MSG[CACHE_ALL_DONE]="All package cache cleared."
+  MSG[STEP_CACHE_ALL]="Completely cleaning ALL package caches & AUR clones..."
+  MSG[CACHE_ALL_DONE]="All package and AUR caches cleared completely."
 
   MSG[STEP_BROKEN]="Cleaning residual download directories..."
   MSG[BROKEN_DONE]="Residual directories removed."
@@ -240,22 +240,43 @@ ORPHANS=$(pacman -Qtdq || true)
 if [[ -n "$ORPHANS" ]]; then
   _warn "${MSG[ORPHAN_FOUND]}"
   mapfile -t ORPHAN_ARR <<< "$ORPHANS"
-  $PKG_MNGR -Rns "${ORPHAN_ARR[@]}"
+  $PKG_MNGR -Rns "${ORPHAN_ARR[@]}" --noconfirm
   _success "${MSG[ORPHAN_CLEAN]}"
 else
   _success "${MSG[ORPHAN_NONE]}"
 fi
 
-# [2] Cache
+# [2] Cache (彻底修复清理不净的问题)
 if [[ "$CLEAN_ALL" == true ]]; then
   _info "${MSG[STEP_CACHE_ALL]}"
-  # 使用 yes 管道强制回答 y，覆盖默认的 N 选项
-  yes | $PKG_MNGR -Scc >/dev/null 2>&1 || true
+  
+  # 1. 使用 sudo 清理 pacman 官方仓库缓存 (彻底)
+  sudo pacman -Scc --noconfirm >/dev/null 2>&1 || true
+  
+  # 2. 清理 AUR 助手缓存并暴力铲除本地 git 源码克隆
+  if command -v yay >/dev/null 2>&1; then
+    yay -Scc --aur --noconfirm >/dev/null 2>&1 || true
+    rm -rf "$HOME/.cache/yay"/* >/dev/null 2>&1 || true
+  fi
+  if command -v paru >/dev/null 2>&1; then
+    paru -Scc --aur --noconfirm >/dev/null 2>&1 || true
+    rm -rf "$HOME/.cache/paru/clone"/* >/dev/null 2>&1 || true
+  fi
+  
   _success "${MSG[CACHE_ALL_DONE]}"
 else
   _info "${MSG[STEP_CACHE]}"
-  # -Sc 的默认选项通常是 Y，所以 --noconfirm 依然适用
-  $PKG_MNGR -Sc --noconfirm >/dev/null 2>&1 || true
+  
+  # 1. 使用 sudo 清理 pacman 官方仓库缓存 (仅限未安装版本)
+  sudo pacman -Sc --noconfirm >/dev/null 2>&1 || true
+  
+  # 2. 清理 AUR 助手的对应缓存
+  if [[ "$PKG_MNGR" == "yay" ]]; then
+    yay -Sc --aur --noconfirm >/dev/null 2>&1 || true
+  elif [[ "$PKG_MNGR" == "paru" ]]; then
+    paru -Sc --aur --noconfirm >/dev/null 2>&1 || true
+  fi
+  
   _success "${MSG[CACHE_DONE]}"
 fi
 
