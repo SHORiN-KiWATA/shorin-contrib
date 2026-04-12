@@ -118,6 +118,8 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[INSTALLED]="[已安装]"
     MSG[INSTALLING]=">> 准备安装："
     MSG[HEADER]="Tab:多选 | Enter:安装 | Ctrl+R:强制刷新 | Esc:退出"
+    MSG[EXEC]="> 正在执行: "
+    MSG[HINT]="如需重试或记录，可复制以下命令："
 else
     MSG[DESC]="Fuzzy search & install packages (Repo + AUR)."
     MSG[OPTS]="Options:"
@@ -135,6 +137,8 @@ else
     MSG[INSTALLED]="[Installed]"
     MSG[INSTALLING]=">> Installing:"
     MSG[HEADER]="Tab:Multi-Select | Enter:Install | Ctrl+R:Force Refresh | Esc:Exit"
+    MSG[EXEC]="> Executing: "
+    MSG[HINT]="For retry or logging, copy the command below:"
 fi
 
 # --- 4. 帮助信息拦截 ---
@@ -207,7 +211,7 @@ COLOR_YELLOW=$'\033[33m'
 COLOR_RESET=$'\033[0m'
 FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
 
-# 构造安全的 reload 命令（利用 printf 转义变量，防止路径中包含空格等字符导致执行崩溃）
+# 构造安全的 reload 命令
 RELOAD_CMD=$(printf "%q " "$SCRIPT_PATH" --generate-list true "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "${MSG[INSTALLED]}")
 
 set +e
@@ -235,9 +239,22 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     done
     
     if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+        # 1. 组合最终的真实执行命令
+        FINAL_CMD="$AUR_HELPER -S ${PACKAGES[*]}"
+        
         echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
         echo "${PACKAGES[*]}"
         echo "----------------------------------------"
+        
+        # 2. 安装前打印 (KISS 哲学)
+        echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
+
+        # 3. 真正执行安装
         "$AUR_HELPER" -S "${PACKAGES[@]}"
+        
+        # 4. 安装结束后留痕，方便复制重试 (KISS 哲学)
+        echo "----------------------------------------"
+        echo -e "\033[36m${MSG[HINT]}\033[0m"
+        echo -e "\033[1;33m$FINAL_CMD\033[0m\n"
     fi
 fi
