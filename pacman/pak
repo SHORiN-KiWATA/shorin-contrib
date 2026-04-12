@@ -48,7 +48,7 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[DESC]="模糊搜索并安装 Flatpak 软件包。"
     MSG[OPTS]="选项："
     MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
-    MSG[OPT_REFRESH]="  --refresh, -y 强制更新 Flatpak AppStream 缓存"
+    MSG[OPT_REFRESH]="  --refresh, -y 强制更新 Flatpak AppStream缓存"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 准确状态：自动比对并显示 [已安装] 标记"
     MSG[FEAT_2]="- 无界排版：清爽的空格对齐，拒绝多余符号"
@@ -62,6 +62,8 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[INSTALLING]=">> 准备安装："
     MSG[REFRESHING]=">> 正在刷新 Flatpak 缓存..."
     MSG[HEADER]="Tab:多选 | Enter:安装 | Esc:退出"
+    MSG[EXEC]="> 正在执行: "
+    MSG[HINT]="如需重试或记录，可复制以下命令："
 else
     MSG[DESC]="Fuzzy search & install Flatpak packages."
     MSG[OPTS]="Options:"
@@ -80,6 +82,8 @@ else
     MSG[INSTALLING]=">> Installing:"
     MSG[REFRESHING]=">> Refreshing Flatpak cache..."
     MSG[HEADER]="Tab:Multi-Select | Enter:Install | Esc:Exit"
+    MSG[EXEC]="> Executing: "
+    MSG[HINT]="For retry or logging, copy the command below:"
 fi
 
 # --- 4. 帮助信息拦截 ---
@@ -199,7 +203,7 @@ fzf --multi --ansi \
 FZF_EXIT=$?
 set -e
 
-# --- 9. 执行安装 ---
+# --- 9. 执行安装 (引入 KISS 留痕逻辑) ---
 if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     mapfile -t SELECTED_LINES < "$TARGET_FILE"
     PACKAGES=()
@@ -211,9 +215,22 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     done
     
     if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+        # 1. 组合最终命令
+        FINAL_CMD="flatpak install ${PACKAGES[*]}"
+
         echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
         echo "${PACKAGES[*]}"
         echo "----------------------------------------"
+        
+        # 2. 安装前静默打印
+        echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
+
+        # 3. 真正执行安装
         flatpak install "${PACKAGES[@]}"
+
+        # 4. 安装结束后高亮留痕
+        echo "----------------------------------------"
+        echo -e "\033[36m${MSG[HINT]}\033[0m"
+        echo -e "\033[1;33m$FINAL_CMD\033[0m\n"
     fi
 fi
