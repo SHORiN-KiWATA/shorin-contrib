@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ===============================================================
-# Arch Linux 系统更新助手 (KISS 独立完美版 - 防部分升级 + 交互防护)
+# Arch Linux 系统更新助手 (KISS 终极联动版 - 防部分升级 + 强制刷新)
 # ===============================================================
 
 # ------------------------------
@@ -13,6 +13,7 @@ set -euo pipefail
 # ------------------------------
 COUNT_LIMIT=15
 NEWS_SOURCE="official"
+SHOW_LIST=0
 
 if [[ "${LC_MESSAGES:-${LANG:-}}" == *zh_CN* ]]; then
   UI_LANG="zh"
@@ -38,6 +39,7 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Options:
+  -l, --list               Launch list (checkallupdates) before updates
   --ui-lang zh|en          UI language (default: auto)
   --news-source official|cn  News source (default: official)
   --count N                Max number of news items (default: 15)
@@ -47,6 +49,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+  -l | --list) SHOW_LIST=1; shift 1 ;;
   --ui-lang) [[ -n "${2:-}" ]] && UI_LANG="$2" && shift 2 || exit 1 ;;
   --news-source) [[ -n "${2:-}" ]] && NEWS_SOURCE="$2" && shift 2 || exit 1 ;;
   --count) [[ -n "${2:-}" ]] && COUNT_LIMIT="$2" && shift 2 || exit 1 ;;
@@ -72,6 +75,8 @@ if [[ "$UI_LANG" == "zh" ]]; then
   TAG_WARN="[注意]"
   TAG_ERROR="[错误]"
 
+  MSG[SYNCING_DATA]="⏳ 正在同步最新软件库数据，请稍候..."
+
   MSG[INTRO_HEADER]="=== Arch Linux 系统更新助手 ==="
   MSG[INTRO_DESC]="本脚本将执行以下操作："
   MSG[INTRO_1]="1. 获取最新 Arch Linux 新闻"
@@ -84,6 +89,8 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[REQ_SUDO]="正在请求管理员权限以更新系统..."
   MSG[SUDO_FAIL]="需要管理员权限才能更新系统。已退出。"
   MSG[NO_HELPER]="未找到 AUR 助手 (paru 或 yay)"
+  MSG[NO_UI]="未找到前端列表脚本 (shorin checkallupdates)，请确认安装shorin-contrib-git。"
+  
   MSG[PREPARING]="准备使用 %s 更新系统..."
   MSG[FETCHING]="正在获取 Arch Linux 新闻..."
   MSG[NEWS_HEADER]="最近 {0} 条 Arch Linux 新闻："
@@ -122,6 +129,8 @@ else
   TAG_WARN="[WARN]"
   TAG_ERROR="[ERROR]"
 
+  MSG[SYNCING_DATA]="⏳ Triggering sync for the latest repository data. Please wait..."
+
   MSG[INTRO_HEADER]="=== Arch Linux System Update Assistant ==="
   MSG[INTRO_DESC]="Actions to perform:"
   MSG[INTRO_1]="1. Fetch latest Arch Linux news"
@@ -134,6 +143,8 @@ else
   MSG[REQ_SUDO]="Requesting sudo..."
   MSG[SUDO_FAIL]="Sudo privileges required. Exiting..."
   MSG[NO_HELPER]="No AUR helper found (paru or yay)"
+  MSG[NO_UI]="Frontend UI script not found (shorin-check-arch-updates)."
+  
   MSG[PREPARING]="Preparing update with %s..."
   MSG[FETCHING]="Fetching news..."
   MSG[NEWS_HEADER]="Recent {0} Arch Linux news items:"
@@ -176,9 +187,35 @@ _success() { local fmt=$1; shift; printf "${H_GREEN}${TAG_SUCCESS}${NC} ${fmt}\n
 _warn()    { local fmt=$1; shift; printf "${H_YELLOW}${TAG_WARN}${NC} ${fmt}\n" "$@"; }
 _error()   { local fmt=$1; shift; printf "${H_RED}${TAG_ERROR}${NC} ${fmt}\n" "$@"; exit 1; }
 
+# ===============================================================
+# 【完美联动防线】：处理 -l 选项，强制刷新缓存后优雅交接给前端 UI
+# ===============================================================
+if [[ $SHOW_LIST == 1 ]]; then
+  printf "\n${H_CYAN}%s${NC}\n" "${MSG[SYNCING_DATA]}"
+  
+  # 1. 唤醒 Waybar 后台守护进程去拉取最新数据
+  pkill -SIGUSR1 -f "check-updates.sh" || true
+  
+  # 2. 短暂避让，确保 Waybar 脚本的 trap 机制顺利拿到文件锁
+  sleep 0.2
+  
+  # 3. 阻塞等待：复用 Waybar 锁文件。直到 Waybar 写完最新缓存释放锁，这里才会放行。
+  ( flock -x -w 120 9 ) 9>"/tmp/waybar-updates.lock" || true
+
+  # 4. 数据绝对新鲜，移交控制权给前端列表界面 (由于缓存是最新的，fzf 会极速秒开)
+  if command -v shorin-check-arch-updates >/dev/null 2>&1; then
+    exec shorin-check-arch-updates
+  elif command -v shorin >/dev/null 2>&1; then
+    exec shorin checkallupdates
+  else
+    _error "${MSG[NO_UI]}"
+  fi
+fi
+
 # ------------------------------
 # 6. Intro & Request Privileges
 # ------------------------------
+clear
 printf "\n${H_CYAN}%s${NC}\n" "${MSG[INTRO_HEADER]}"
 printf "%s\n" "${MSG[INTRO_DESC]}"
 printf "  %s\n" "${MSG[INTRO_1]}"
@@ -265,7 +302,7 @@ check_mirror_age() {
 }
 
 # ------------------------------
-# 8. Update Function (核心：独立同步与安全断点警告)
+# 8. Update Function (防部分升级核心)
 # ------------------------------
 perform_update() {
   if command -v quicksave >/dev/null 2>&1 && [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]]; then 
@@ -281,7 +318,6 @@ perform_update() {
     KEYRING_TARGETS+=("archlinuxcn-keyring")
   fi
 
-  # 同步数据库与密钥环（这里用 --noconfirm 是安全的，只更新密钥）
   if sudo pacman -Sy --needed --noconfirm "${KEYRING_TARGETS[@]}"; then
     _success "${MSG[KEYRING_OK]}"
   else
@@ -291,8 +327,7 @@ perform_update() {
   _log "${MSG[STEP_2]}"
   
   # ===============================================================
-  # 【防部分升级防线】：执行交互式 -Su 更新。如果失败或被用户强行中止(Ctrl+C)，
-  # 则拦截退出码，并抛出严重警告，阻止用户误操作。
+  # 【致命警告防线】：强制交互模式并捕获错误
   # ===============================================================
   if ! $UPDATE_CMD -Su; then
     printf "\n${H_RED}======================================================================${NC}\n"
@@ -320,12 +355,11 @@ perform_update() {
     _warn "grub-mkconfig not found. Skipping GRUB update."
   fi
 
-  # 无论是否使用 checkallupdates 脚本，更新完后静默唤醒 Waybar 模块是个好习惯
   pkill -SIGUSR1 -f "check-updates.sh" || true
 }
 
 # ------------------------------
-# 9. Main Execution (纯粹的线性流程)
+# 9. Main Execution
 # ------------------------------
 _log "${MSG[PREPARING]}" "$UPDATE_CMD"
 _log "${MSG[FETCHING]}"
