@@ -75,7 +75,7 @@ if [[ "$UI_LANG" == "zh" ]]; then
   TAG_WARN="[注意]"
   TAG_ERROR="[错误]"
 
-  MSG[SYNCING_DATA]="⏳ 正在触发后台同步最新软件库数据，请稍候..."
+  MSG[SYNCING_DATA]="⏳ 正在同步最新软件库数据，请稍候..."
   MSG[NO_UI_FALLBACK]="[警告] 未找到前端列表界面，直接进入更新流程..."
 
   MSG[INTRO_HEADER]="=== Arch Linux 系统更新助手 ==="
