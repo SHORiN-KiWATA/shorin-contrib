@@ -140,7 +140,7 @@ main() {
         clear
         echo -e "${C_CYAN}正在启动系统更新 (shorin sysup)...${C_RESET}\n"
         
-        shorin sysup --do-update
+        shorin sysup 
         
         echo -e "\n${C_PRIMARY}更新流程结束${C_RESET}"
 

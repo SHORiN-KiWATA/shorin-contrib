@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ===============================================================
-# Arch Linux 系统更新助手 (完美版 - 防部分升级 + 强制刷新 + 双语UI)
+# Arch Linux 系统更新助手 (KISS 独立完美版 - 防部分升级 + 交互防护)
 # ===============================================================
 
 # ------------------------------
@@ -13,7 +13,6 @@ set -euo pipefail
 # ------------------------------
 COUNT_LIMIT=15
 NEWS_SOURCE="official"
-DO_UPDATE=0 # 是否已通过前端可视化界面确认
 
 if [[ "${LC_MESSAGES:-${LANG:-}}" == *zh_CN* ]]; then
   UI_LANG="zh"
@@ -42,7 +41,6 @@ Options:
   --ui-lang zh|en          UI language (default: auto)
   --news-source official|cn  News source (default: official)
   --count N                Max number of news items (default: 15)
-  --do-update              Bypass UI check and perform update directly
   --help, -h               Show this help and exit
 EOF
 }
@@ -52,7 +50,6 @@ while [[ $# -gt 0 ]]; do
   --ui-lang) [[ -n "${2:-}" ]] && UI_LANG="$2" && shift 2 || exit 1 ;;
   --news-source) [[ -n "${2:-}" ]] && NEWS_SOURCE="$2" && shift 2 || exit 1 ;;
   --count) [[ -n "${2:-}" ]] && COUNT_LIMIT="$2" && shift 2 || exit 1 ;;
-  --do-update) DO_UPDATE=1; shift 1 ;; # 接收来自 checkallupdates 的确认指令
   --help | -h)
     usage
     exit 0
@@ -66,7 +63,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------
-# 4. Localization Logic (Associative Arrays)
+# 4. Localization Logic
 # ------------------------------
 declare -A MSG
 if [[ "$UI_LANG" == "zh" ]]; then
@@ -75,15 +72,12 @@ if [[ "$UI_LANG" == "zh" ]]; then
   TAG_WARN="[注意]"
   TAG_ERROR="[错误]"
 
-  MSG[SYNCING_DATA]="⏳ 正在同步最新软件库数据，请稍候..."
-  MSG[NO_UI_FALLBACK]="[警告] 未找到前端列表界面，直接进入更新流程..."
-
   MSG[INTRO_HEADER]="=== Arch Linux 系统更新助手 ==="
   MSG[INTRO_DESC]="本脚本将执行以下操作："
   MSG[INTRO_1]="1. 获取最新 Arch Linux 新闻"
   MSG[INTRO_2]="2. 检查镜像源时效并按需更新"
   MSG[INTRO_3]="3. 同步软件数据库并更新 GPG 密钥环"
-  MSG[INTRO_4]="4. 升级系统软件包"
+  MSG[INTRO_4]="4. 升级系统软件包 (交互模式防冲突)"
   MSG[INTRO_5]="5. 更新 Flatpak 应用"
   MSG[INTRO_6]="6. 重新生成 GRUB 配置文件"
 
@@ -93,7 +87,7 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[PREPARING]="准备使用 %s 更新系统..."
   MSG[FETCHING]="正在获取 Arch Linux 新闻..."
   MSG[NEWS_HEADER]="最近 {0} 条 Arch Linux 新闻："
-  MSG[CONFIRM]="请阅读上述新闻。确认使用 %s 继续更新吗？[Y/n]"
+  MSG[CONFIRM]="请阅读上述新闻。确认使用 %s 开始更新吗？[Y/n]"
   MSG[CANCEL]="更新已取消。"
   MSG[ERR_FETCH]="获取新闻失败（网络或源错误）"
   MSG[FORCE_ASK]="是否忽略新闻强制更新？[y/N]"
@@ -117,21 +111,23 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[MIR_SKIP]="跳过镜像源更新。"
   MSG[MIR_NO_FILE]="未找到 Reflector 时间标记，跳过检查。"
   MSG[MIR_NO_SCRIPT]="错误：未在 %s 找到更新脚本。"
+
+  MSG[WARN_PARTIAL_TITLE]="[致命警告] 系统更新被中断或发生冲突失败！"
+  MSG[WARN_PARTIAL_1]="您的本地软件库数据库已被更新，但软件包尚未成功升级。"
+  MSG[WARN_PARTIAL_2]="【绝对禁止】在此状态下运行 pacman -S 安装新软件，这会导致部分升级进而损坏系统！"
+  MSG[WARN_PARTIAL_3]="请尽快排查冲突原因，并重新运行 sysup 完成系统升级。"
 else
   TAG_INFO="[INFO]"
   TAG_SUCCESS="[OK]"
   TAG_WARN="[WARN]"
   TAG_ERROR="[ERROR]"
 
-  MSG[SYNCING_DATA]="⏳ Triggering background sync for the latest repository data. Please wait..."
-  MSG[NO_UI_FALLBACK]="[WARN] Frontend UI not found. Proceeding directly to update flow..."
-
   MSG[INTRO_HEADER]="=== Arch Linux System Update Assistant ==="
   MSG[INTRO_DESC]="Actions to perform:"
   MSG[INTRO_1]="1. Fetch latest Arch Linux news"
   MSG[INTRO_2]="2. Check mirrorlist age & Update if needed"
   MSG[INTRO_3]="3. Sync Pacman DB & Update GPG Keyrings"
-  MSG[INTRO_4]="4. Upgrade system packages"
+  MSG[INTRO_4]="4. Upgrade system packages (Interactive)"
   MSG[INTRO_5]="5. Update Flatpak apps"
   MSG[INTRO_6]="6. Re-generate GRUB config"
 
@@ -153,7 +149,7 @@ else
   MSG[STEP_1]="[2/6] Sync DB & Keyrings"
   MSG[KEYRING_OK]="DB & Keyrings synced."
   MSG[KEYRING_WARN]="Keyring issues detected..."
-  MSG[STEP_2]="[3/6] Upgrading system"
+  MSG[STEP_2]="[3/6] Upgrading system..."
   MSG[STEP_3]="[4/6] Checking Flatpak updates"
   MSG[STEP_4]="[5/6] Updating GRUB"
   MSG[GRUB_OK]="GRUB updated."
@@ -165,35 +161,11 @@ else
   MSG[MIR_SKIP]="Skipping mirror update."
   MSG[MIR_NO_FILE]="No Reflector timestamp found. Skipping."
   MSG[MIR_NO_SCRIPT]="Error: mirror-update script not found at %s"
-fi
 
-# ===============================================================
-# 【核心机制】：拦截直接运行 -> 强制刷新缓存 -> 重定向至 UI 列表
-# ===============================================================
-# 将该逻辑移动到字典声明之后，确保能正确调用双语提示
-if [[ $DO_UPDATE == 0 ]]; then
-  printf "\n${H_CYAN}%s${NC}\n" "${MSG[SYNCING_DATA]}"
-  
-  # 1. 唤醒 Waybar 后台守护进程去拉取最新数据
-  pkill -SIGUSR1 -f "check-updates.sh" || true
-  
-  # 2. 短暂避让，确保 Waybar 脚本的 trap 机制顺利拿到文件锁
-  sleep 0.2
-  
-  # 3. 阻塞等待：复用 Waybar 锁文件。直到 Waybar 写完最新缓存释放锁，这里才会放行。
-  (
-      flock -x -w 120 9
-  ) 9>"/tmp/waybar-updates.lock" || true
-
-  # 4. 数据绝对新鲜，移交控制权给前端列表界面 (由于缓存是最新的，fzf 会极速秒开)
-  if command -v shorin-check-arch-updates >/dev/null 2>&1; then
-    exec shorin-check-arch-updates
-  elif command -v shorin >/dev/null 2>&1; then
-    exec shorin checkallupdates
-  else
-    printf "${H_YELLOW}%s${NC}\n" "${MSG[NO_UI_FALLBACK]}"
-    sleep 2
-  fi
+  MSG[WARN_PARTIAL_TITLE]="[CRITICAL] System update interrupted or failed!"
+  MSG[WARN_PARTIAL_1]="Local databases are updated, but packages are not."
+  MSG[WARN_PARTIAL_2]="[DANGER] DO NOT install new packages (pacman -S) in this state! It will cause a partial upgrade."
+  MSG[WARN_PARTIAL_3]="Please resolve any conflicts and run sysup again ASAP."
 fi
 
 # ------------------------------
@@ -207,7 +179,6 @@ _error()   { local fmt=$1; shift; printf "${H_RED}${TAG_ERROR}${NC} ${fmt}\n" "$
 # ------------------------------
 # 6. Intro & Request Privileges
 # ------------------------------
-clear
 printf "\n${H_CYAN}%s${NC}\n" "${MSG[INTRO_HEADER]}"
 printf "%s\n" "${MSG[INTRO_DESC]}"
 printf "  %s\n" "${MSG[INTRO_1]}"
@@ -246,7 +217,6 @@ fi
 # ------------------------------
 check_mirror_age() {
   _log "${MSG[STEP_MIRROR]}"
-
   local MIRROR_LIST="/etc/pacman.d/mirrorlist"
   local THRESHOLD=$((30 * 24 * 60 * 60))
   local UPDATE_SCRIPT="$HOME/.local/bin/mirror-update"
@@ -269,8 +239,7 @@ check_mirror_age() {
       if [[ "$diff" -gt "$THRESHOLD" ]]; then
         printf "${H_YELLOW}${TAG_WARN}${NC} "
         printf "${MSG[MIR_OLD]} " "$days_old"
-        local choice
-        read -r choice || true
+        local choice; read -r choice || true
         choice=${choice:-Y}
 
         if [[ "$choice" =~ ^[Yy]$ ]]; then
@@ -296,7 +265,7 @@ check_mirror_age() {
 }
 
 # ------------------------------
-# 8. Update Function (防部分升级架构)
+# 8. Update Function (核心：独立同步与安全断点警告)
 # ------------------------------
 perform_update() {
   if command -v quicksave >/dev/null 2>&1 && [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]]; then 
@@ -312,6 +281,7 @@ perform_update() {
     KEYRING_TARGETS+=("archlinuxcn-keyring")
   fi
 
+  # 同步数据库与密钥环（这里用 --noconfirm 是安全的，只更新密钥）
   if sudo pacman -Sy --needed --noconfirm "${KEYRING_TARGETS[@]}"; then
     _success "${MSG[KEYRING_OK]}"
   else
@@ -319,7 +289,20 @@ perform_update() {
   fi
 
   _log "${MSG[STEP_2]}"
-  $UPDATE_CMD -Su --noconfirm
+  
+  # ===============================================================
+  # 【防部分升级防线】：执行交互式 -Su 更新。如果失败或被用户强行中止(Ctrl+C)，
+  # 则拦截退出码，并抛出严重警告，阻止用户误操作。
+  # ===============================================================
+  if ! $UPDATE_CMD -Su; then
+    printf "\n${H_RED}======================================================================${NC}\n"
+    printf "${H_RED}%s${NC}\n" "${MSG[WARN_PARTIAL_TITLE]}"
+    printf "${H_YELLOW}• %s${NC}\n" "${MSG[WARN_PARTIAL_1]}"
+    printf "${H_YELLOW}• %s${NC}\n" "${MSG[WARN_PARTIAL_2]}"
+    printf "${H_YELLOW}• %s${NC}\n" "${MSG[WARN_PARTIAL_3]}"
+    printf "${H_RED}======================================================================${NC}\n\n"
+    exit 1
+  fi
 
   if command -v flatpak >/dev/null 2>&1; then
     _log "${MSG[STEP_3]}"
@@ -337,12 +320,12 @@ perform_update() {
     _warn "grub-mkconfig not found. Skipping GRUB update."
   fi
 
-  # 最终清理状态并更新模块 UI
+  # 无论是否使用 checkallupdates 脚本，更新完后静默唤醒 Waybar 模块是个好习惯
   pkill -SIGUSR1 -f "check-updates.sh" || true
 }
 
 # ------------------------------
-# 9. Main Execution
+# 9. Main Execution (纯粹的线性流程)
 # ------------------------------
 _log "${MSG[PREPARING]}" "$UPDATE_CMD"
 _log "${MSG[FETCHING]}"
