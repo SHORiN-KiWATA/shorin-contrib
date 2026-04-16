@@ -4,30 +4,17 @@
 # 开启严格模式：遇到错误、未定义变量、管道错误即停止运行
 set -euo pipefail
 
-#export SHELL="$(command -v bash || echo /bin/bash)"
-
 # ===============================================================
-# Arch Linux 系统更新助手 (完美版 - 集成镜像源检查)
+# Arch Linux 系统更新助手 (完美版 - 防部分升级 + 强制刷新 + 双语UI)
 # ===============================================================
-# 【整体功能概述】
-# 01. 支持从 Arch Linux 官方/中文社区获取最新新闻资讯
-# 02. 智能解析新闻并高亮显示需要"手动干预"的警告信息
-# 03. 等待用户确认后执行系统更新
-# 04. 自动检测并优先使用 AUR 助手 (paru 或 yay)
-# 05. 智能检测镜像源时效 (超过30天提示更新) -> 调用 mirror-update
-# 06. 智能更新 GPG 密钥环 (自动扫描 pacman.conf 识别 archlinuxcn)
-# 07. 自动静默更新 Flatpak 应用 (如果已安装)
-# 08. 更新后自动执行 GRUB 配置更新 (grub-mkconfig)
-# 09. 自动请求并后台保持 sudo 权限 (使用 trap 机制安全退出)
-# 10. 自动检测系统语言 (zh_CN) 实现中英双语支持
-# 11. 更新完成后静默刷新 Waybar 模块
 
 # ------------------------------
 # 1. Default parameters & KISS Language Detection
 # ------------------------------
 COUNT_LIMIT=15
 NEWS_SOURCE="official"
-# 直接利用 Bash 内置的环境变量匹配，不调用外部进程
+DO_UPDATE=0 # 是否已通过前端可视化界面确认
+
 if [[ "${LC_MESSAGES:-${LANG:-}}" == *zh_CN* ]]; then
   UI_LANG="zh"
 else
@@ -55,6 +42,7 @@ Options:
   --ui-lang zh|en          UI language (default: auto)
   --news-source official|cn  News source (default: official)
   --count N                Max number of news items (default: 15)
+  --do-update              Bypass UI check and perform update directly
   --help, -h               Show this help and exit
 EOF
 }
@@ -64,6 +52,7 @@ while [[ $# -gt 0 ]]; do
   --ui-lang) [[ -n "${2:-}" ]] && UI_LANG="$2" && shift 2 || exit 1 ;;
   --news-source) [[ -n "${2:-}" ]] && NEWS_SOURCE="$2" && shift 2 || exit 1 ;;
   --count) [[ -n "${2:-}" ]] && COUNT_LIMIT="$2" && shift 2 || exit 1 ;;
+  --do-update) DO_UPDATE=1; shift 1 ;; # 接收来自 checkallupdates 的确认指令
   --help | -h)
     usage
     exit 0
@@ -77,7 +66,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------
-# 4. Localization Logic (Associative Arrays - Safe & Fast)
+# 4. Localization Logic (Associative Arrays)
 # ------------------------------
 declare -A MSG
 if [[ "$UI_LANG" == "zh" ]]; then
@@ -85,6 +74,9 @@ if [[ "$UI_LANG" == "zh" ]]; then
   TAG_SUCCESS="[成功]"
   TAG_WARN="[注意]"
   TAG_ERROR="[错误]"
+
+  MSG[SYNCING_DATA]="⏳ 正在触发后台同步最新软件库数据，请稍候..."
+  MSG[NO_UI_FALLBACK]="[警告] 未找到前端列表界面，直接进入更新流程..."
 
   MSG[INTRO_HEADER]="=== Arch Linux 系统更新助手 ==="
   MSG[INTRO_DESC]="本脚本将执行以下操作："
@@ -131,6 +123,9 @@ else
   TAG_WARN="[WARN]"
   TAG_ERROR="[ERROR]"
 
+  MSG[SYNCING_DATA]="⏳ Triggering background sync for the latest repository data. Please wait..."
+  MSG[NO_UI_FALLBACK]="[WARN] Frontend UI not found. Proceeding directly to update flow..."
+
   MSG[INTRO_HEADER]="=== Arch Linux System Update Assistant ==="
   MSG[INTRO_DESC]="Actions to perform:"
   MSG[INTRO_1]="1. Fetch latest Arch Linux news"
@@ -172,8 +167,37 @@ else
   MSG[MIR_NO_SCRIPT]="Error: mirror-update script not found at %s"
 fi
 
+# ===============================================================
+# 【核心机制】：拦截直接运行 -> 强制刷新缓存 -> 重定向至 UI 列表
+# ===============================================================
+# 将该逻辑移动到字典声明之后，确保能正确调用双语提示
+if [[ $DO_UPDATE == 0 ]]; then
+  printf "\n${H_CYAN}%s${NC}\n" "${MSG[SYNCING_DATA]}"
+  
+  # 1. 唤醒 Waybar 后台守护进程去拉取最新数据
+  pkill -SIGUSR1 -f "check-updates.sh" || true
+  
+  # 2. 短暂避让，确保 Waybar 脚本的 trap 机制顺利拿到文件锁
+  sleep 0.2
+  
+  # 3. 阻塞等待：复用 Waybar 锁文件。直到 Waybar 写完最新缓存释放锁，这里才会放行。
+  (
+      flock -x -w 120 9
+  ) 9>"/tmp/waybar-updates.lock" || true
+
+  # 4. 数据绝对新鲜，移交控制权给前端列表界面 (由于缓存是最新的，fzf 会极速秒开)
+  if command -v shorin-check-arch-updates >/dev/null 2>&1; then
+    exec shorin-check-arch-updates
+  elif command -v shorin >/dev/null 2>&1; then
+    exec shorin checkallupdates
+  else
+    printf "${H_YELLOW}%s${NC}\n" "${MSG[NO_UI_FALLBACK]}"
+    sleep 2
+  fi
+fi
+
 # ------------------------------
-# 5. Logging Functions (支持类似 printf 的格式化输出)
+# 5. Logging Functions
 # ------------------------------
 _log()     { local fmt=$1; shift; printf "${H_BLUE}${TAG_INFO}${NC} ${fmt}\n" "$@"; }
 _success() { local fmt=$1; shift; printf "${H_GREEN}${TAG_SUCCESS}${NC} ${fmt}\n" "$@"; }
@@ -183,6 +207,7 @@ _error()   { local fmt=$1; shift; printf "${H_RED}${TAG_ERROR}${NC} ${fmt}\n" "$
 # ------------------------------
 # 6. Intro & Request Privileges
 # ------------------------------
+clear
 printf "\n${H_CYAN}%s${NC}\n" "${MSG[INTRO_HEADER]}"
 printf "%s\n" "${MSG[INTRO_DESC]}"
 printf "  %s\n" "${MSG[INTRO_1]}"
@@ -197,7 +222,6 @@ if ! sudo -v; then
   _error "${MSG[SUDO_FAIL]}"
 fi
 
-# Keep sudo alive in background (添加 || true 避免严格模式下 kill 失败导致报错)
 while true; do
   sudo -n true
   sleep 60
@@ -272,18 +296,17 @@ check_mirror_age() {
 }
 
 # ------------------------------
-# 8. Update Function
+# 8. Update Function (防部分升级架构)
 # ------------------------------
 perform_update() {
-if command -v quicksave >/dev/null 2>&1 && [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]]; then 
-    _log "${MSG[SNAP]}"
-    quicksave -d quicksave-sysup
-fi
+  if command -v quicksave >/dev/null 2>&1 && [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]]; then 
+      _log "${MSG[SNAP]}"
+      quicksave -d quicksave-sysup
+  fi
 
   check_mirror_age
 
   _log "${MSG[STEP_1]}"
-  # 使用 Bash 数组存储目标软件包 (最佳工程实践)
   local KEYRING_TARGETS=("archlinux-keyring")
   if grep -q "^\[archlinuxcn\]" /etc/pacman.conf; then
     KEYRING_TARGETS+=("archlinuxcn-keyring")
@@ -296,7 +319,7 @@ fi
   fi
 
   _log "${MSG[STEP_2]}"
-  $UPDATE_CMD -Syu
+  $UPDATE_CMD -Su --noconfirm
 
   if command -v flatpak >/dev/null 2>&1; then
     _log "${MSG[STEP_3]}"
@@ -314,8 +337,8 @@ fi
     _warn "grub-mkconfig not found. Skipping GRUB update."
   fi
 
-  # 使用 || true 避免 Waybar 未运行时 pkill 返回 1 触发 set -e 中断
-  pkill -SIGUSR1 -f ~/.config/waybar/scripts/check-updates.sh || true
+  # 最终清理状态并更新模块 UI
+  pkill -SIGUSR1 -f "check-updates.sh" || true
 }
 
 # ------------------------------
@@ -359,7 +382,6 @@ else
   NEWS_URL="https://archlinux.org/feeds/news/"
 fi
 
-# 抑制 Python 的输出流可能导致的管道错误异常
 if curl -sS -L --connect-timeout 15 -A "Mozilla/5.0" "$NEWS_URL" |
   python -c "$PYTHON_SCRIPT" "$COUNT_LIMIT" "${MSG[NEWS_HEADER]}"; then
 
