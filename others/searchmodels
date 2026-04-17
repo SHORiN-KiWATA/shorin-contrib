@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""
+AI Model Browser TUI (searchmodels)
+Browse available models from various AI providers.
+Supports h/j/k/l navigation, dynamic 2/3-column layout, and local API key caching.
+Fully supports CJK (Chinese/Japanese/Korean) display and input methods.
+"""
+
+import os
+# 解决 Curses 默认按 Esc 键有 1 秒延迟的痛点
+os.environ.setdefault('ESCDELAY', '25')
+
+import curses
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
+import threading
+import subprocess
+import sys
+import time
+import base64
+import traceback
+import locale
+import unicodedata
+
+# 初始化 Locale 以启用底层宽字符与中文输入法支持
+locale.setlocale(locale.LC_ALL, '')
+
+# ─── i18n & CJK Utils ───
+def is_chinese_env():
+    lang = os.environ.get("LC_ALL") or os.environ.get("LANG") or ""
+    if lang.lower().startswith("zh"):
+        return True
+    try:
+        # Fallback 备用方案
+        loc = locale.getlocale()[0] or ""
+        return loc.lower().startswith("zh")
+    except Exception:
+        return False
+
+LANG = "zh" if is_chinese_env() else "en"
+
+I18N = {
+    "en": {
+        "prov_title": " PROVIDERS ",
+        "model_title": " MODELS ",
+        "filter_title": " FILTER: {} ",
+        "fetching": " Fetching models...",
+        "no_match": "No models match.",
+        "no_models": "No models found.",
+        "copied": "✓ Copied: {}",
+        "copy_fail": "⚠ Clipboard fail",
+        "add_title": " ADD CUSTOM PROVIDER ",
+        "edit_title": " EDIT PROVIDER ",
+        "nav_hint": " (j/k: Select | Enter: Edit/Save | Esc: Cancel) ",
+        "edit_hint": " (←/→: Move Cursor | Enter: Done Editing) ",
+        "lbl_name": "Name:",
+        "lbl_url": "URL :",
+        "lbl_key": "Key :",
+        "btn_save": "[ Save ]",
+        "btn_cancel": "[ Cancel ]",
+        "status_search": " SEARCH: {}_ (Enter: Confirm | Esc: Cancel) ",
+        "status_nav": " [q]Quit [/]Search [r]Reload [a]Add_Cus [d]Del_Cus [h/l]Switch [j/k]Move [Enter]Edit/Copy ",
+        "auth_fail": "Auth Fail ({}). Press Enter on Provider to set API Key.",
+        "term_small": "Terminal too small!",
+    },
+    "zh": {
+        "prov_title": " 提供商 ",
+        "model_title": " 模型 ",
+        "filter_title": " 搜索: {} ",
+        "fetching": " 正在获取模型...",
+        "no_match": "没有匹配的模型。",
+        "no_models": "未找到模型。",
+        "copied": "✓ 已复制: {}",
+        "copy_fail": "⚠ 复制失败",
+        "add_title": " 添加自定义提供商 ",
+        "edit_title": " 编辑提供商 ",
+        "nav_hint": " (j/k:选择 | 回车:编辑/保存 | Esc:取消) ",
+        "edit_hint": " (←/→:移动光标 | 回车:完成编辑) ",
+        "lbl_name": "名称:",
+        "lbl_url": "URL :",
+        "lbl_key": "密钥:",
+        "btn_save": "[ 保存 ]",
+        "btn_cancel": "[ 取消 ]",
+        "status_search": " 搜索: {}_ (回车:确认 | Esc:取消) ",
+        "status_nav": " [q]退出 [/]搜索 [r]重载 [a]添加自定义 [d]删除自定义 [h/l]切换 [j/k]移动 [回车]编辑/复制 ",
+        "auth_fail": "鉴权失败 ({})。请按回车设置 API 密钥。",
+        "term_small": "终端窗口太小！",
+    }
+}
+
+def t(key, *args):
+    s = I18N[LANG].get(key, key)
+    if args: return s.format(*args)
+    return s
+
+def str_width(s):
+    """计算中英文字符串在终端的实际显示宽度 (东亚全角字符算2)"""
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in s)
+
+def truncate_str(s, max_width):
+    """根据显示宽度安全截断字符串"""
+    w = 0
+    res = []
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+        if w + cw > max_width: break
+        res.append(c)
+        w += cw
+    return "".join(res)
+
+def pad_str(s, width):
+    """根据显示宽度填充空格对齐"""
+    w = str_width(s)
+    return s + " " * max(0, width - w)
+
+
+# ─── API Key Storage Logic ───
+CACHE_DIR = os.path.expanduser("~/.cache/searchmodels")
+KEY_FILE = os.path.join(CACHE_DIR, "keys.json")
+CUSTOM_FILE = os.path.join(CACHE_DIR, "custom.json")
+
+def get_machine_salt():
+    return "searchmodels_local_salt_8a2b"
+
+def xor_crypt(text, key=None):
+    if not text: return ""
+    if not key: key = get_machine_salt()
+    expanded_key = (key * (len(text) // len(key) + 1))[:len(text)]
+    return "".join(chr(ord(c) ^ ord(k)) for c, k in zip(text, expanded_key))
+
+def load_keys():
+    if not os.path.exists(KEY_FILE): return {}
+    try:
+        with open(KEY_FILE, "r") as f: data = json.load(f)
+        result = {}
+        for k, v in data.items():
+            decrypted = xor_crypt(base64.b64decode(v.encode()).decode())
+            if not any(ord(c) < 32 for c in decrypted):
+                result[k] = decrypted
+        return result
+    except Exception: return {}
+
+def save_key(provider_name, api_key):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    try:
+        with open(KEY_FILE, "r") as f: data = json.load(f)
+    except Exception: data = {}
+    data[provider_name] = base64.b64encode(xor_crypt(api_key).encode()).decode()
+    with open(KEY_FILE, "w") as f: json.dump(data, f)
+    try: os.chmod(KEY_FILE, 0o600)
+    except Exception: pass
+
+def load_custom_providers():
+    if not os.path.exists(CUSTOM_FILE): return []
+    try:
+        with open(CUSTOM_FILE, "r") as f: 
+            data = json.load(f)
+            if isinstance(data, list): return data
+    except Exception: pass
+    return []
+
+def save_custom_providers(providers):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    customs = [p for p in providers if p.get("is_custom")]
+    with open(CUSTOM_FILE, "w") as f: json.dump(customs, f)
+
+# ─── Providers Setup ───
+DEFAULT_PROVIDERS = [
+    {"name": "DeepSeek", "models_url": "https://api.deepseek.com/v1/models"},
+    {"name": "Google Gemini", "models_url": "https://generativelanguage.googleapis.com/v1beta/models"},
+    {"name": "Xiaomi (Mimo)", "models_url": "https://api.xiaomimimo.com/v1/models"},
+    {"name": "OpenRouter", "models_url": "https://openrouter.ai/api/v1/models"},
+    {"name": "Ollama", "models_url": "http://localhost:11434/api/tags", "parse_key": "ollama_tags"},
+    {"name": "LM Studio", "models_url": "http://localhost:1234/v1/models"},
+    {"name": "SiliconFlow", "models_url": "https://api.siliconflow.cn/v1/models"},
+    {"name": "Claude", "models_url": "https://api.anthropic.com/v1/models", "extra_headers": {"anthropic-version": "2023-06-01"}},
+    {"name": "OpenAI", "models_url": "https://api.openai.com/v1/models"},
+    {"name": "MiniMax", "models_url": "https://api.minimaxi.com/v1/models"},
+    {"name": "MiniMax Global", "models_url": "https://api.minimax.io/v1/models"},
+    {"name": "Nvidia", "models_url": "https://integrate.api.nvidia.com/v1/models"},
+    {"name": "Grok", "models_url": "https://api.x.ai/v1/models"},
+    {"name": "Mistral", "models_url": "https://api.mistral.ai/v1/models"},
+]
+
+def parse_models(data, parse_key=None):
+    if not isinstance(data, (dict, list)): return []
+    if isinstance(data, dict):
+        if parse_key == "ollama_tags":
+            return [m.get("name", "") for m in data.get("models", []) if isinstance(m, dict)]
+        if "data" in data and isinstance(data["data"], list):
+            return [(m.get("id") or m.get("name") or "") if isinstance(m, dict) else str(m) for m in data["data"]]
+        if "models" in data and isinstance(data["models"], list):
+            return [(m.get("name", "").replace("models/", "") or m.get("id", "")) if isinstance(m, dict) else str(m) for m in data["models"]]
+    if isinstance(data, list):
+        return [(m.get("id") or m.get("name") or str(m)) if isinstance(m, dict) else str(m) for m in data]
+    return []
+
+def fetch_models(provider, api_key=None):
+    url = provider["models_url"]
+    headers = {"User-Agent": "searchmodels-tui/2.0", "Accept": "application/json"}
+    
+    if api_key:
+        if "generativelanguage.googleapis.com" in url:
+            headers["x-goog-api-key"] = api_key
+        elif "api.anthropic.com" in url:
+            headers["x-api-key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["x-api-key"] = api_key  
+            
+    headers.update(provider.get("extra_headers", {}))
+    
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return [m for m in parse_models(data, provider.get("parse_key")) if m], None
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403): return [], t("auth_fail", e.code)
+        return [], f"HTTP {e.code}: {e.reason}"
+    except Exception as e:
+        return [], str(e)
+
+def copy_to_clipboard(text):
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            return True
+        elif sys.platform.startswith("linux"):
+            for cmd in [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
+                try:
+                    subprocess.run(cmd, input=text.encode(), check=True, stderr=subprocess.DEVNULL)
+                    return True
+                except Exception: continue
+        elif sys.platform == "win32":
+            subprocess.run(["clip"], input=text.encode("gbk"), check=True)
+            return True
+    except Exception: pass
+    return False
+
+# ─── Colors ───
+C_PRIMARY  = 1   
+C_CYAN     = 2   
+C_TERTIARY = 3   
+C_GRAY     = 4   
+C_SUCCESS  = 5   
+C_ERROR    = 6   
+
+class App:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.providers = list(DEFAULT_PROVIDERS) + load_custom_providers()
+        self.keys = load_keys()
+        
+        self.active_col = 0
+        self.prov_idx = 0
+        self.org_idx = 0
+        self.model_idx = 0
+        self.scrolls = [0, 0, 0] 
+        
+        self.raw_models = []
+        self.parsed_tree = {} 
+        self.org_list = []
+        self.model_list = []  
+        self.show_org = False  # 动态双列/三列控制
+        
+        self.loading = False
+        self.error = ""
+        self.filter_str = ""
+        self.filter_mode = False
+        
+        self.selected_model_name = ""
+        self.status_msg = ""
+        self.status_flash = 0
+        
+        self.prompt_mode = 0 
+        self.form_fields = ["", "", ""] 
+        self.form_idx = 0 
+        self.form_is_new = False
+        self.form_cursor_pos = 0
+        self.form_scroll = 0
+        
+        self.fetch_seq = 0
+
+        self._init_colors()
+        curses.curs_set(0)
+        self.stdscr.timeout(100)
+
+    def _init_colors(self):
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+
+        pairs = [
+            (C_PRIMARY,  curses.COLOR_BLUE, bg),
+            (C_CYAN,     curses.COLOR_CYAN, bg),
+            (C_TERTIARY, curses.COLOR_MAGENTA, bg),
+            (C_GRAY,     curses.COLOR_WHITE, bg),
+            (C_SUCCESS,  curses.COLOR_GREEN, bg),
+            (C_ERROR,    curses.COLOR_RED, bg),
+        ]
+        for idx, fg, b in pairs:
+            try: curses.init_pair(idx, fg, b)
+            except curses.error: pass
+
+    def _safe_addstr(self, win, y, x, text, attr=0):
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w: return
+        
+        limit = (w - x - 1) if y == h - 1 else (w - x)
+        
+        if str_width(text) > limit:
+            if all(c == "─" for c in text):
+                text = truncate_str(text, limit)
+            else:
+                text = truncate_str(text, limit - 3) + "..."
+                
+        if not text: return
+        try: win.addstr(y, x, text, attr)
+        except curses.error: pass
+
+    def run(self):
+        while True:
+            self._draw()
+            
+            # 使用 get_wch 完美支持中文宽字符与原生输入法输入
+            try:
+                k = self.stdscr.get_wch()
+            except curses.error:
+                # Timeout tick
+                if not self._handle_key(-1): break
+                continue
+                
+            if not self._handle_key(k): break
+
+    def _validate_col_focus(self):
+        if not self.show_org and self.active_col == 1:
+            self.active_col = 2 if self.model_list else 0
+        if self.active_col == 2 and not self.model_list:
+            self.active_col = 1 if self.show_org else 0
+        if self.active_col == 1 and not self.org_list:
+            self.active_col = 0
+
+    def _trigger_fetch(self):
+        prov = self.providers[self.prov_idx]
+        p_name = prov["name"]
+        
+        self.raw_models = []
+        self.parsed_tree = {}
+        self.org_list = []
+        self.model_list = []
+        self.org_idx = 0
+        self.model_idx = 0
+        self.scrolls[1] = 0
+        self.scrolls[2] = 0
+        
+        self.loading = True
+        self.error = ""
+        self.show_org = False
+        self._validate_col_focus()
+
+        self.fetch_seq += 1
+        seq = self.fetch_seq
+        api_key = self.keys.get(p_name, None)
+
+        def worker():
+            m, err = fetch_models(prov, api_key)
+            if getattr(self, 'fetch_seq', 0) != seq: return
+            self.raw_models = m
+            self.error = err or ""
+            self._rebuild_tree()
+            self.loading = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _rebuild_tree(self):
+        if not self.providers: return
+        prov = self.providers[self.prov_idx]
+        prov_name_lower = prov["name"].lower()
+        self.parsed_tree = {}
+        f = self.filter_str.lower()
+        
+        valid_models = [m for m in self.raw_models if not f or f in m.lower()]
+        
+        if not valid_models:
+            self.org_list = []
+            self.show_org = False
+            self._update_model_list()
+            return
+            
+        self.parsed_tree["All"] = []
+        
+        for m in valid_models:
+            if "/" in m: org, name = m.split("/", 1)
+            else: org, name = prov["name"], m
+            
+            self.parsed_tree["All"].append({"name": name, "full": m})
+            
+            if org.lower() not in ["models", prov_name_lower] and org.lower() not in prov_name_lower:
+                if org not in self.parsed_tree: 
+                    self.parsed_tree[org] = []
+                self.parsed_tree[org].append({"name": name, "full": m})
+            
+        orgs = sorted([k for k in self.parsed_tree.keys() if k != "All"])
+        self.org_list = ["All"] + orgs
+        
+        # 智能判定：如果只有一个组织 (All)，就隐藏中间列
+        self.show_org = len(self.org_list) > 1
+        
+        self.org_idx = min(self.org_idx, max(0, len(self.org_list) - 1))
+        self._update_model_list()
+
+    def _update_model_list(self):
+        if not self.org_list: self.model_list = []
+        else:
+            org = self.org_list[self.org_idx]
+            self.model_list = sorted(self.parsed_tree[org], key=lambda x: x["name"].lower())
+        self.model_idx = min(self.model_idx, max(0, len(self.model_list) - 1))
+        self._validate_col_focus()
+
+    def _copy(self, text):
+        if text:
+            ok = copy_to_clipboard(text)
+            self.status_msg = t("copied", text) if ok else t("copy_fail")
+            self.status_flash = 30
+
+    def _save_form(self):
+        name, url, api_key = [s.strip() for s in self.form_fields]
+        if name and url:
+            if self.form_is_new:
+                self.providers.append({"name": name, "models_url": url, "is_custom": True})
+                self.prov_idx = len(self.providers) - 1
+            else:
+                self.providers[self.prov_idx]["name"] = name
+                self.providers[self.prov_idx]["models_url"] = url
+                
+            if api_key:
+                save_key(name, api_key)
+                self.keys[name] = api_key
+                
+            save_custom_providers(self.providers)
+            self._trigger_fetch()
+        self.prompt_mode = 0
+
+    def _handle_key(self, k):
+        if k == -1:
+            if self.status_flash > 0: self.status_flash -= 1
+            else: self.status_msg = ""
+            return True
+
+        # 解析 get_wch 的按键
+        code = k if isinstance(k, int) else ord(k)
+        char = "" if isinstance(k, int) else k
+
+        if self.prompt_mode == 1:
+            if code == 27:  
+                self.prompt_mode = 0
+            elif code == 9: 
+                self.form_idx = (self.form_idx + 1) % 5
+            elif code == curses.KEY_DOWN or char.lower() == 'j':
+                if self.form_idx < 2: self.form_idx += 1
+                elif self.form_idx == 2: self.form_idx = 3 
+            elif code == curses.KEY_UP or char.lower() == 'k':
+                if self.form_idx in (3, 4): self.form_idx = 2
+                elif self.form_idx > 0: self.form_idx -= 1
+            elif code == curses.KEY_LEFT or char.lower() == 'h':
+                if self.form_idx == 4: self.form_idx = 3
+            elif code == curses.KEY_RIGHT or char.lower() == 'l':
+                if self.form_idx == 3: self.form_idx = 4
+            elif code in (10, 13):
+                if self.form_idx in (0, 1, 2):
+                    self.prompt_mode = 2 
+                    self.form_cursor_pos = len(self.form_fields[self.form_idx])
+                    self.form_scroll = 0
+                elif self.form_idx == 3:
+                    self._save_form()
+                elif self.form_idx == 4:
+                    self.prompt_mode = 0
+            return True
+
+        if self.prompt_mode == 2:
+            val = self.form_fields[self.form_idx]
+            if code == 27 or code in (10, 13): 
+                self.prompt_mode = 1
+            elif code == curses.KEY_LEFT:
+                self.form_cursor_pos = max(0, self.form_cursor_pos - 1)
+            elif code == curses.KEY_RIGHT:
+                self.form_cursor_pos = min(len(val), self.form_cursor_pos + 1)
+            elif code == curses.KEY_HOME or code == 1: 
+                self.form_cursor_pos = 0
+            elif code == curses.KEY_END or code == 5:  
+                self.form_cursor_pos = len(val)
+            elif code in (curses.KEY_BACKSPACE, 127, 8):
+                if self.form_cursor_pos > 0:
+                    self.form_fields[self.form_idx] = val[:self.form_cursor_pos - 1] + val[self.form_cursor_pos:]
+                    self.form_cursor_pos -= 1
+            elif code == curses.KEY_DC: 
+                if self.form_cursor_pos < len(val):
+                    self.form_fields[self.form_idx] = val[:self.form_cursor_pos] + val[self.form_cursor_pos + 1:]
+            elif char and char.isprintable(): # 完美支持中文与普通字符输入
+                self.form_fields[self.form_idx] = val[:self.form_cursor_pos] + char + val[self.form_cursor_pos:]
+                self.form_cursor_pos += 1
+            return True
+
+        if self.filter_mode:
+            if code == 27 or code == curses.KEY_F3:
+                self.filter_mode = False
+                self.filter_str = ""
+                self._rebuild_tree()
+            elif code in (10, 13):
+                self.filter_mode = False
+            elif code in (curses.KEY_BACKSPACE, 127, 8):
+                self.filter_str = self.filter_str[:-1]
+                self._rebuild_tree()
+            elif char and char.isprintable():
+                self.filter_str += char
+                self._rebuild_tree()
+            return True
+
+        # ─── 主视图操作 ───
+        if char.lower() == 'q': return False
+
+        if code == curses.KEY_LEFT or char.lower() == 'h':
+            if self.active_col == 2:
+                self.active_col = 1 if self.show_org else 0
+            elif self.active_col == 1:
+                self.active_col = 0
+                
+        elif code == curses.KEY_RIGHT or char.lower() == 'l':
+            if self.active_col == 0:
+                if self.show_org and self.org_list:
+                    self.active_col = 1
+                elif not self.show_org and self.model_list:
+                    self.active_col = 2
+            elif self.active_col == 1:
+                if self.model_list:
+                    self.active_col = 2
+
+        elif code == curses.KEY_DOWN or char.lower() == 'j':
+            if self.active_col == 0 and self.prov_idx < len(self.providers) - 1:
+                self.prov_idx += 1
+                self._trigger_fetch()
+            elif self.active_col == 1 and self.org_idx < len(self.org_list) - 1:
+                self.org_idx += 1
+                self._update_model_list()
+            elif self.active_col == 2 and self.model_idx < len(self.model_list) - 1:
+                self.model_idx += 1
+                
+        elif code == curses.KEY_UP or char.lower() == 'k':
+            if self.active_col == 0 and self.prov_idx > 0:
+                self.prov_idx -= 1
+                self._trigger_fetch()
+            elif self.active_col == 1 and self.org_idx > 0:
+                self.org_idx -= 1
+                self._update_model_list()
+            elif self.active_col == 2 and self.model_idx > 0:
+                self.model_idx -= 1
+
+        elif code in (10, 13) or char == ' ':
+            if self.active_col == 0:
+                p = self.providers[self.prov_idx]
+                self.prompt_mode = 1
+                self.form_is_new = False
+                self.form_fields = [p["name"], p.get("models_url", ""), self.keys.get(p["name"], "")]
+                self.form_idx = 2 
+            elif self.active_col == 1:
+                if self.model_list:
+                    self.active_col = 2
+            elif self.active_col == 2:
+                if self.model_list:
+                    text = self.model_list[self.model_idx]["name"]
+                    self.selected_model_name = text
+                    self._copy(text)
+        
+        elif char.lower() == 'y':
+            if self.active_col == 2 and self.model_list:
+                text = self.model_list[self.model_idx]["name"]
+                self.selected_model_name = text
+                self._copy(text)
+            
+        elif char == '/':
+            self.filter_mode = True
+            
+        elif char.lower() == 'r':
+            self._trigger_fetch()
+            
+        elif char.lower() == 'a':
+            self.prompt_mode = 1
+            self.form_is_new = True
+            self.form_fields = ["", "", ""]
+            self.form_idx = 0
+            
+        elif char.lower() == 'd':
+            if self.active_col == 0 and self.providers:
+                p = self.providers[self.prov_idx]
+                if p.get("is_custom"):
+                    del self.providers[self.prov_idx]
+                    self.prov_idx = max(0, min(self.prov_idx, len(self.providers) - 1))
+                    save_custom_providers(self.providers)
+                    self._trigger_fetch()
+
+        if self.status_flash > 0: self.status_flash -= 1
+        else: self.status_msg = ""
+
+        return True
+
+    def _clamp_scroll(self, list_len, idx, scroll_idx, h):
+        list_h = h - 2
+        if idx < self.scrolls[scroll_idx]:
+            self.scrolls[scroll_idx] = idx
+        elif idx >= self.scrolls[scroll_idx] + list_h:
+            self.scrolls[scroll_idx] = idx - list_h + 1
+
+    def _draw(self):
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        if h < 10 or w < 50:
+            self._safe_addstr(self.stdscr, 0, 0, t("term_small"), curses.color_pair(C_ERROR))
+            self.stdscr.refresh()
+            return
+
+        max_prov_len = max((str_width(p["name"]) for p in self.providers), default=20) if self.providers else 20
+        w1 = max(22, min(32, max_prov_len + 4))
+
+        if self.show_org:
+            max_org_len = max((str_width(o) for o in self.org_list), default=20) if self.org_list else 20
+            w2 = max(22, min(32, max_org_len + 4))
+        else:
+            w2 = 0
+
+        # 如果不显示 Org (w2=0)，则只有一条分割线
+        w3 = w - w1 - w2 - (2 if self.show_org else 1)
+
+        for row in range(0, h - 1):
+            self._safe_addstr(self.stdscr, row, w1, "│", curses.color_pair(C_GRAY) | curses.A_DIM)
+            if self.show_org:
+                self._safe_addstr(self.stdscr, row, w1 + 1 + w2, "│", curses.color_pair(C_GRAY) | curses.A_DIM)
+
+        self._draw_status(h - 1, w)
+        self.stdscr.noutrefresh()
+
+        prov_win = curses.newwin(h - 1, w1, 0, 0)
+        self._draw_list(prov_win, h - 1, w1, t("prov_title"), [p["name"] for p in self.providers], self.prov_idx, 0, 0)
+        prov_win.noutrefresh()
+
+        if self.show_org:
+            org_win = curses.newwin(h - 1, w2, 0, w1 + 1)
+            # 根据要求，不显示 ORGANIZATIONS 文字，置空即可
+            self._draw_list(org_win, h - 1, w2, "", self.org_list, self.org_idx, 1, 1)
+            org_win.noutrefresh()
+
+        model_win = curses.newwin(h - 1, w3, 0, w1 + 1 + w2 + (1 if self.show_org else 0))
+        self._draw_models(model_win, h - 1, w3, 2)
+        model_win.noutrefresh()
+
+        self._draw_overlay(h, w)
+        curses.doupdate()
+
+    def _draw_list(self, win, h, w, title, items, cur_idx, scroll_idx, col_idx):
+        is_active = (self.active_col == col_idx)
+        border_attr = curses.color_pair(C_GRAY) | curses.A_DIM
+        title_attr = curses.color_pair(C_PRIMARY) | curses.A_BOLD if is_active else curses.color_pair(C_CYAN)
+        
+        self._safe_addstr(win, 0, 0, "─" * w, border_attr)
+        self._safe_addstr(win, 0, max(0, (w - str_width(title)) // 2), title, title_attr)
+
+        self._clamp_scroll(len(items), cur_idx, scroll_idx, h)
+        list_h = h - 2
+        show_cursor = (col_idx <= self.active_col)
+        
+        for i in range(list_h):
+            idx = i + self.scrolls[scroll_idx]
+            if idx >= len(items): break
+            
+            name = items[idx]
+            is_cur = (idx == cur_idx) and show_cursor
+            
+            if is_cur and is_active:
+                attr = curses.color_pair(C_PRIMARY) | curses.A_BOLD | curses.A_REVERSE
+                prefix = "► "
+            elif is_cur:
+                attr = curses.color_pair(C_CYAN) | curses.A_REVERSE
+                prefix = "  "
+            else:
+                attr = curses.color_pair(C_CYAN)
+                prefix = "  "
+                
+            disp_text = prefix + name
+            self._safe_addstr(win, i + 1, 0, pad_str(disp_text, w - 1), attr)
+            
+        self._safe_addstr(win, h - 1, 0, "─" * w, border_attr)
+
+    def _draw_models(self, win, h, w, col_idx):
+        is_active = (self.active_col == col_idx)
+        border_attr = curses.color_pair(C_GRAY) | curses.A_DIM
+        title_attr = curses.color_pair(C_PRIMARY) | curses.A_BOLD if is_active else curses.color_pair(C_CYAN)
+        
+        title = t("filter_title", self.filter_str) if self.filter_str else t("model_title")
+        self._safe_addstr(win, 0, 0, "─" * w, border_attr)
+        self._safe_addstr(win, 0, max(0, (w - str_width(title)) // 2), title, title_attr)
+
+        if self.loading:
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            f = frames[int(time.time() * 8) % len(frames)]
+            self._safe_addstr(win, 2, 2, f"{f} {t('fetching').strip()}", curses.color_pair(C_CYAN))
+        elif self.error:
+            self._safe_addstr(win, 2, 2, f"✗ {self.error}", curses.color_pair(C_ERROR))
+        elif not self.model_list:
+            msg = t("no_match") if self.filter_str else t("no_models")
+            self._safe_addstr(win, 2, 2, msg, curses.color_pair(C_CYAN) | curses.A_DIM)
+        else:
+            self._clamp_scroll(len(self.model_list), self.model_idx, 2, h)
+            list_h = h - 2
+            show_cursor = (col_idx <= self.active_col)
+            
+            for i in range(list_h):
+                idx = i + self.scrolls[2]
+                if idx >= len(self.model_list): break
+                m = self.model_list[idx]
+                is_cur = (idx == self.model_idx) and show_cursor
+                
+                if is_cur and is_active:
+                    attr = curses.color_pair(C_PRIMARY) | curses.A_BOLD | curses.A_REVERSE
+                    prefix = "► "
+                elif is_cur:
+                    attr = curses.color_pair(C_CYAN) | curses.A_REVERSE
+                    prefix = "  "
+                else:
+                    attr = curses.color_pair(C_CYAN)
+                    prefix = "  "
+                    
+                disp_text = prefix + m['name']
+                self._safe_addstr(win, i + 1, 0, pad_str(disp_text, w - 1), attr)
+                
+        self._safe_addstr(win, h - 1, 0, "─" * w, border_attr)
+
+    def _draw_overlay(self, h, w):
+        if not self.prompt_mode: return
+        
+        box_h, box_w = 10, min(w - 4, 75)
+        box_y, box_x = (h - box_h) // 2, (w - box_w) // 2
+        
+        title = t("add_title") if self.form_is_new else t("edit_title")
+        hint = t("nav_hint") if self.prompt_mode == 1 else t("edit_hint")
+
+        self._safe_addstr(self.stdscr, box_y, box_x, "┌" + "─"*(box_w-2) + "┐", curses.color_pair(C_TERTIARY))
+        for r in range(1, box_h-1):
+            self._safe_addstr(self.stdscr, box_y + r, box_x, "│" + " "*(box_w-2) + "│", curses.color_pair(C_TERTIARY))
+        self._safe_addstr(self.stdscr, box_y + box_h - 1, box_x, "└" + "─"*(box_w-2) + "┘", curses.color_pair(C_TERTIARY))
+
+        self._safe_addstr(self.stdscr, box_y, box_x + 2, title, curses.color_pair(C_PRIMARY) | curses.A_BOLD)
+        self._safe_addstr(self.stdscr, box_y + box_h - 1, box_x + 2, hint, curses.color_pair(C_CYAN))
+
+        labels = [t("lbl_name"), t("lbl_url"), t("lbl_key")]
+        for i in range(3):
+            label = labels[i]
+            val = self.form_fields[i]
+            is_secret = (i == 2)
+            
+            disp_val = ("*" * len(val)) if is_secret else val
+            disp_val += " " 
+            
+            y = box_y + 2 + i
+            self._safe_addstr(self.stdscr, y, box_x + 2, label, curses.color_pair(C_CYAN))
+            
+            field_w = box_w - 12
+            field_x = box_x + 8
+            
+            if self.prompt_mode == 2 and i == self.form_idx:
+                if self.form_cursor_pos < self.form_scroll:
+                    self.form_scroll = self.form_cursor_pos
+                elif self.form_cursor_pos >= self.form_scroll + field_w:
+                    self.form_scroll = self.form_cursor_pos - field_w + 1
+                    
+                visible_str = disp_val[self.form_scroll : self.form_scroll + field_w]
+                cursor_rel = self.form_cursor_pos - self.form_scroll
+                
+                left_str = visible_str[:cursor_rel]
+                cursor_char = visible_str[cursor_rel] if cursor_rel < len(visible_str) else " "
+                right_str = visible_str[cursor_rel + 1:]
+                
+                x_pos = field_x
+                self._safe_addstr(self.stdscr, y, x_pos, left_str, curses.color_pair(C_CYAN) | curses.A_UNDERLINE)
+                x_pos += str_width(left_str)
+                self._safe_addstr(self.stdscr, y, x_pos, cursor_char, curses.color_pair(C_PRIMARY) | curses.A_REVERSE)
+                x_pos += str_width(cursor_char)
+                self._safe_addstr(self.stdscr, y, x_pos, right_str, curses.color_pair(C_CYAN) | curses.A_UNDERLINE)
+                
+                filled_w = str_width(left_str) + str_width(cursor_char) + str_width(right_str)
+                if filled_w < field_w:
+                    self._safe_addstr(self.stdscr, y, field_x + filled_w, " " * (field_w - filled_w), curses.color_pair(C_CYAN) | curses.A_UNDERLINE)
+            else:
+                visible_str = truncate_str(disp_val, field_w)
+                # Ensure the field background looks clean
+                visible_str = pad_str(visible_str, field_w)
+                    
+                attr = curses.color_pair(C_PRIMARY) | curses.A_REVERSE if (self.prompt_mode == 1 and i == self.form_idx) else curses.color_pair(C_CYAN) | curses.A_UNDERLINE
+                self._safe_addstr(self.stdscr, y, field_x, visible_str, attr)
+
+        save_attr = curses.color_pair(C_PRIMARY) | curses.A_REVERSE if (self.prompt_mode == 1 and self.form_idx == 3) else curses.color_pair(C_CYAN)
+        cancel_attr = curses.color_pair(C_PRIMARY) | curses.A_REVERSE if (self.prompt_mode == 1 and self.form_idx == 4) else curses.color_pair(C_CYAN)
+        
+        self._safe_addstr(self.stdscr, box_y + 7, box_x + 10, t("btn_save"), save_attr)
+        self._safe_addstr(self.stdscr, box_y + 7, box_x + 25, t("btn_cancel"), cancel_attr)
+
+    def _draw_status(self, row, w):
+        if self.status_msg and self.status_flash > 0:
+            msg = f" {self.status_msg} "
+            attr = curses.color_pair(C_SUCCESS) | curses.A_BOLD
+        elif self.filter_mode:
+            msg = t("status_search", self.filter_str)
+            attr = curses.color_pair(C_TERTIARY) | curses.A_BOLD
+        else:
+            msg = t("status_nav")
+            attr = curses.color_pair(C_CYAN) | curses.A_DIM
+            
+        self._safe_addstr(self.stdscr, row, 0, pad_str(msg, w)[:w], attr)
+
+def main():
+    def _run(stdscr):
+        app = App(stdscr)
+        app._trigger_fetch()
+        app.run()
+        
+    try: 
+        curses.wrapper(_run)
+    except KeyboardInterrupt: 
+        pass
+    except Exception as e:
+        log_path = os.path.expanduser("~/.cache/searchmodels/crash.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w") as f: 
+            traceback.print_exc(file=f)
+        print(f"FATAL ERROR: {e}\nCheck crash log at: {log_path}")
+
+if __name__ == "__main__":
+    main()
