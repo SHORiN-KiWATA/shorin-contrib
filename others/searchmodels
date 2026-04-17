@@ -253,6 +253,8 @@ class App:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.providers = list(DEFAULT_PROVIDERS) + load_custom_providers()
+        # 将提供商进行排序：先排默认，后排custom；同类项内部按名称首字母忽略大小写排序
+        self.providers.sort(key=lambda p: (p.get("is_custom", False), p.get("name", "").lower()))
         self.keys = load_keys()
         
         self.active_col = 0
@@ -360,6 +362,10 @@ class App:
         self.scrolls[1] = 0
         self.scrolls[2] = 0
         
+        # 切换 Provider 时，一并重置搜索记录
+        self.filter_str = ""
+        self.filter_mode = False
+        
         self.loading = True
         self.error = ""
         self.show_org = False
@@ -435,7 +441,6 @@ class App:
         if name and url:
             if self.form_is_new:
                 self.providers.append({"name": name, "models_url": url, "is_custom": True})
-                self.prov_idx = len(self.providers) - 1
             else:
                 self.providers[self.prov_idx]["name"] = name
                 self.providers[self.prov_idx]["models_url"] = url
@@ -445,6 +450,14 @@ class App:
                 self.keys[name] = api_key
                 
             save_custom_providers(self.providers)
+            
+            # 添加或修改完之后重新排序，并将焦点移动到编辑过的项目上
+            self.providers.sort(key=lambda p: (p.get("is_custom", False), p.get("name", "").lower()))
+            for i, p in enumerate(self.providers):
+                if p["name"] == name:
+                    self.prov_idx = i
+                    break
+                    
             self._trigger_fetch()
         self.prompt_mode = 0
 
@@ -527,10 +540,18 @@ class App:
         if char.lower() == 'q': return False
 
         if code == curses.KEY_LEFT or char.lower() == 'h':
+            col_changed = False
             if self.active_col == 2:
                 self.active_col = 1 if self.show_org else 0
+                col_changed = True
             elif self.active_col == 1:
                 self.active_col = 0
+                col_changed = True
+                
+            # 返回父级菜单时清空搜索记录
+            if col_changed and self.filter_str:
+                self.filter_str = ""
+                self._rebuild_tree()
                 
         elif code == curses.KEY_RIGHT or char.lower() == 'l':
             if self.active_col == 0:
