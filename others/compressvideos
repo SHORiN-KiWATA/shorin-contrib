@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# 压缩视频大小
+
+set -u
+
+# ==========================================
+# 默认配置 (可通过选项覆盖)
+# ==========================================
+DEFAULT_CODEC="h264"      # 默认编码格式
+DEFAULT_DEVICE="auto"     # 默认硬件设备
+DEFAULT_QUALITY=5         # 默认压缩画质
+
+# ==========================================
+# 变量初始化
+# ==========================================
+CODEC="$DEFAULT_CODEC"
+DEVICE="$DEFAULT_DEVICE"
+QUALITY="$DEFAULT_QUALITY"
+PAUSE_ON_EXIT=0
+CURRENT_OUT=""
+FILES=()
+OUT_FILES=()
+ACTION_LIST_DEVICES=0
+ACTION_LIST_CODECS=0
+
+# ==========================================
+# 颜色与日志配置
+# ==========================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_err()  { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+log_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
+
+# ==========================================
+# 动态编解码器检测
+# ==========================================
+get_nvenc_codecs() {
+    ffmpeg -hide_banner -encoders 2>/dev/null | awk '/nvenc/ && /^ V/ {print $2}' | sed 's/_nvenc//' | sort
+}
+
+get_vaapi_codecs() {
+    ffmpeg -hide_banner -encoders 2>/dev/null | awk '/vaapi/ && /^ V/ {print $2}' | sed 's/_vaapi//' | sort
+}
+
+get_cpu_codecs() {
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "libx264" && echo "h264"
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "libx265" && echo "hevc"
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "libvpx-vp9" && echo "vp9"
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE "libsvtav1|libaom-av1" && echo "av1"
+}
+
+is_codec_supported() {
+    local dev="$1"
+    local c="$2"
+    case "$dev" in
+        nvidia) get_nvenc_codecs | grep -qw "$c" ;;
+        amdgpu|intel) get_vaapi_codecs | grep -qw "$c" ;;
+        cpu) get_cpu_codecs | grep -qw "$c" ;;
+    esac
+}
+
+list_codecs() {
+    local target_dev="$1"
+    echo "可用的视频编码格式 (基于设备 $target_dev 自动检测):"
+    
+    if [[ "$target_dev" == "auto" || "$target_dev" == "nvidia" ]]; then
+        local nv_codecs=$(get_nvenc_codecs)
+        if [ -n "$nv_codecs" ]; then
+            echo "  [Nvidia NVENC]"
+            for c in $nv_codecs; do
+                echo "    - $c"
+            done
+        fi
+    fi
+    
+    if [[ "$target_dev" == "auto" || "$target_dev" == "amdgpu" || "$target_dev" == "intel" ]]; then
+        local va_codecs=$(get_vaapi_codecs)
+        if [ -n "$va_codecs" ]; then
+            echo "  [VAAPI]"
+            for c in $va_codecs; do
+                echo "    - $c"
+            done
+        fi
+    fi
+    
+    if [[ "$target_dev" == "auto" || "$target_dev" == "cpu" ]]; then
+        local cpu_codecs=$(get_cpu_codecs)
+        if [ -n "$cpu_codecs" ]; then
+            echo "  [CPU]"
+            for c in $cpu_codecs; do
+                echo "    - $c"
+            done
+        fi
+    fi
+}
+
+list_accel_devices() {
+    echo "可用的硬件加速设备:"
+    local found=0
+    
+    for dev in /sys/class/drm/renderD*; do
+        [ -e "$dev/device/driver/module" ] || continue
+        driver=$(basename "$(readlink -f "$dev/device/driver/module")")
+        
+        if [[ "$driver" == "nvidia" || "$driver" == "nvidia_drm" ]]; then
+            echo "  - nvidia (NVENC, 设备: /dev/dri/$(basename "$dev"))"
+            found=1
+        elif [[ "$driver" == "amdgpu" || "$driver" == "radeon" ]]; then
+            echo "  - amdgpu (VAAPI, 设备: /dev/dri/$(basename "$dev"))"
+            found=1
+        elif [[ "$driver" == "i915" || "$driver" == "xe" ]]; then
+            echo "  - intel  (VAAPI, 设备: /dev/dri/$(basename "$dev"))"
+            found=1
+        fi
+    done
+    
+    echo "  - cpu    (软件编码)"
+}
+
+# ==========================================
+# 帮助文档
+# ==========================================
+usage() {
+    cat <<USAGE
+用法: $(basename "$0") [选项] [文件...]
+
+视频批量压缩脚本，支持硬件编解码与自动回退检测。
+
+选项:
+  -i, --input <file>        指定输入文件路径
+  -o, --output <file>       指定输出文件路径。
+                            如果后缀名是 mp3, wav, m4a 等音频格式，则只输出音频。
+  -c, --codec [codec]       指定视频编码格式。默认: $DEFAULT_CODEC
+                            如果不提供参数，则列出当前可用编码格式。
+  -d, --accel-device [dev]  指定硬件加速设备。默认: $DEFAULT_DEVICE
+                            如果不提供参数，则列出当前可用硬件设备。
+  -q, --quality <1-10>      设置视频压缩画质 (1~10)。默认: $DEFAULT_QUALITY
+  -p, --pause               执行完毕后需按任意键退出
+  -h, --help                显示帮助信息
+USAGE
+}
+
+# ==========================================
+# 参数解析
+# ==========================================
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -d|--accel-device|-ad)
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                DEVICE="$2"
+                shift 2
+            else
+                ACTION_LIST_DEVICES=1
+                shift 1
+            fi
+            ;;
+        -c|--codec|-e|--encoder)
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                CODEC="$2"
+                shift 2
+            else
+                ACTION_LIST_CODECS=1
+                shift 1
+            fi
+            ;;
+        -i|--input)
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                FILES+=("$2")
+                shift 2
+            else
+                log_err "选项 $1 需要提供文件路径。"
+                exit 1
+            fi
+            ;;
+        -o|--output)
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                OUT_FILES+=("$2")
+                shift 2
+            else
+                log_err "选项 $1 需要提供输出路径。"
+                exit 1
+            fi
+            ;;
+        -q|--quality)
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                QUALITY="$2"
+                shift 2
+            else
+                log_err "选项 $1 需要提供画质挡位 (1~10)。"
+                exit 1
+            fi
+            ;;
+        -p|--pause)
+            PAUSE_ON_EXIT=1
+            shift 1
+            ;;
+        -*)
+            log_err "未知选项: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            FILES+=("$1")
+            shift 1
+            ;;
+    esac
+done
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    log_err "未找到 ffmpeg，请先安装 ffmpeg 以检测和执行操作。"
+    exit 1
+fi
+
+# 处理仅列表操作
+if [ "$ACTION_LIST_DEVICES" -eq 1 ]; then
+    list_accel_devices
+    exit 0
+fi
+
+if [ "$ACTION_LIST_CODECS" -eq 1 ]; then
+    list_codecs "$DEVICE"
+    exit 0
+fi
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+    log_err "未提供输入文件。"
+    usage
+    exit 1
+fi
+
+if [[ ${#OUT_FILES[@]} -gt 0 && ${#FILES[@]} -ne ${#OUT_FILES[@]} ]]; then
+    log_err "错误: 输入文件数量 (${#FILES[@]}) 与输出文件数量 (${#OUT_FILES[@]}) 不匹配。"
+    exit 1
+fi
+
+case "$DEVICE" in
+    auto|nvidia|amdgpu|intel|cpu) ;;
+    *) log_err "不支持的硬件设备: $DEVICE"; exit 1 ;;
+esac
+
+if ! [[ "$QUALITY" =~ ^([1-9]|10)$ ]]; then
+    log_err "画质参数必须是 1 到 10 之间的整数。"
+    exit 1
+fi
+
+# ==========================================
+# 辅助函数
+# ==========================================
+
+get_crf_value() {
+    case "$1" in
+        1) echo 38 ;;
+        2) echo 35 ;;
+        3) echo 32 ;;
+        4) echo 29 ;;
+        5) echo 26 ;;
+        6) echo 23 ;;
+        7) echo 20 ;;
+        8) echo 17 ;;
+        9) echo 14 ;;
+        10) echo 11 ;;
+        *) echo 26 ;;
+    esac
+}
+
+get_drm_device() {
+    local target_driver="$1"
+    for dev in /sys/class/drm/renderD*; do
+        [ -e "$dev/device/driver/module" ] || continue
+        driver=$(basename "$(readlink -f "$dev/device/driver/module")")
+        
+        if [ "$target_driver" = "auto" ] || [ "$target_driver" = "intel" ]; then
+            if [[ "$driver" == "i915" || "$driver" == "xe" ]]; then
+                echo "/dev/dri/$(basename "$dev")"
+                return
+            fi
+        fi
+        
+        if [ "$target_driver" = "auto" ] || [ "$target_driver" = "amdgpu" ]; then
+            if [[ "$driver" == "amdgpu" || "$driver" == "radeon" ]]; then
+                echo "/dev/dri/$(basename "$dev")"
+                return
+            fi
+        fi
+    done
+}
+
+is_audio_only() {
+    local ext="${1##*.}"
+    ext="${ext,,}"
+    case "$ext" in
+        mp3|wav|m4a|flac|aac|ogg|wma|opus) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ==========================================
+# 信号捕获
+# ==========================================
+cleanup() {
+    if [ -n "$CURRENT_OUT" ] && [ -f "$CURRENT_OUT" ]; then
+        log_warn "进程被中断，清理未完成的文件: $CURRENT_OUT"
+        rm -f "$CURRENT_OUT"
+    fi
+    exit 130
+}
+trap cleanup SIGINT SIGTERM
+
+# ==========================================
+# 编码器执行函数
+# ==========================================
+run_audio_only() {
+    local in="$1" out="$2"
+    log_info "目标格式为音频 (${out##*.})，仅提取/转换音频流..."
+    if ffmpeg -y -i "$in" -vn "$out" </dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+run_nvenc() {
+    local in="$1" out="$2"
+    local vcodec="${CODEC}_nvenc"
+    local crf_val=$(get_crf_value "$QUALITY")
+    
+    log_info "启动 NVENC ($CODEC) 硬件编解码 (画质等级: $QUALITY/10)..."
+    ffmpeg -y -hwaccel cuda -i "$in" \
+        -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+        -c:v "$vcodec" -preset p4 -cq "$crf_val" -c:a aac -b:a 128k -pix_fmt yuv420p "$out" </dev/null
+}
+
+run_vaapi() {
+    local in="$1" out="$2" dev="$3"
+    local vcodec="${CODEC}_vaapi"
+    local crf_val=$(get_crf_value "$QUALITY")
+    
+    log_info "启动 VAAPI ($CODEC) 硬件编解码 [设备: $dev] (画质等级: $QUALITY/10)..."
+    ffmpeg -y -hwaccel vaapi -hwaccel_device "$dev" -hwaccel_output_format vaapi -i "$in" \
+        -vf "scale_vaapi=w=trunc(iw/2)*2:h=trunc(ih/2)*2" \
+        -c:v "$vcodec" -qp "$crf_val" -c:a aac -b:a 128k "$out" </dev/null
+}
+
+run_cpu() {
+    local in="$1" out="$2"
+    local vcodec="libx264"
+    case "$CODEC" in
+        h264) vcodec="libx264" ;;
+        hevc) vcodec="libx265" ;;
+        vp9) vcodec="libvpx-vp9" ;;
+        av1) 
+            if ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "libsvtav1"; then
+                vcodec="libsvtav1"
+            else
+                vcodec="libaom-av1"
+            fi
+            ;;
+        *) vcodec="$CODEC" ;;
+    esac
+    local crf_val=$(get_crf_value "$QUALITY")
+    
+    log_info "启动 CPU ($CODEC) 软件编解码 (画质等级: $QUALITY/10)..."
+    ffmpeg -y -i "$in" \
+        -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+        -c:v "$vcodec" -crf "$crf_val" -preset fast -c:a aac -b:a 128k -pix_fmt yuv420p "$out" </dev/null
+}
+
+# ==========================================
+# 主处理循环
+# ==========================================
+for i in "${!FILES[@]}"; do
+    f="${FILES[$i]}"
+    
+    if [ ! -f "$f" ]; then
+        log_warn "跳过 '$f': 不是一个标准文件。"
+        continue
+    fi
+
+    if [ ${#OUT_FILES[@]} -gt 0 ]; then
+        CURRENT_OUT="${OUT_FILES[$i]}"
+        # 自动补全后缀名逻辑
+        if [[ "$(basename "$CURRENT_OUT")" != *.* ]]; then
+            CURRENT_OUT="${CURRENT_OUT}.mp4"
+        fi
+    else
+        CURRENT_OUT="${f%.*}_compressed.mp4"
+    fi
+
+    echo "---------------------------------------------------"
+    log_info "正在处理: $(basename "$f") -> $(basename "$CURRENT_OUT")"
+    
+    success=0
+
+    # 0. 仅提取音频逻辑
+    if is_audio_only "$CURRENT_OUT"; then
+        if run_audio_only "$f" "$CURRENT_OUT"; then
+            log_ok "音频处理成功: $(basename "$CURRENT_OUT")"
+        else
+            log_err "音频处理失败。"
+            [ -f "$CURRENT_OUT" ] && rm -f "$CURRENT_OUT"
+        fi
+        continue
+    fi
+
+    # 1. 尝试 NVENC
+    if [ "$DEVICE" = "auto" ] || [ "$DEVICE" = "nvidia" ]; then
+        if is_codec_supported "nvidia" "$CODEC"; then
+            if command -v nvidia-smi >/dev/null 2>&1 || ls /dev/nvidia* >/dev/null 2>&1; then
+                if run_nvenc "$f" "$CURRENT_OUT"; then
+                    log_ok "Nvidia 硬件压缩成功: $(basename "$CURRENT_OUT")"
+                    success=1
+                else
+                    log_warn "Nvidia 硬件压缩失败。"
+                    [ -f "$CURRENT_OUT" ] && rm -f "$CURRENT_OUT"
+                fi
+            else
+                if [ "$DEVICE" = "nvidia" ]; then
+                    log_err "未检测到 Nvidia 驱动/设备，无法使用 Nvidia 硬件加速。"
+                else
+                    log_info "未检测到 Nvidia 设备，跳过 Nvidia 硬件加速。"
+                fi
+            fi
+        else
+            if [ "$DEVICE" = "nvidia" ]; then
+                log_err "Nvidia NVENC 不支持编码格式: $CODEC"
+            fi
+        fi
+    fi
+
+    # 2. 尝试 VAAPI
+    if [ $success -eq 0 ] && { [ "$DEVICE" = "auto" ] || [ "$DEVICE" = "intel" ] || [ "$DEVICE" = "amdgpu" ]; }; then
+        if is_codec_supported "intel" "$CODEC"; then
+            actual_vaapi_dev=$(get_drm_device "$DEVICE")
+            
+            if [ -n "$actual_vaapi_dev" ] && [ -e "$actual_vaapi_dev" ]; then
+                if run_vaapi "$f" "$CURRENT_OUT" "$actual_vaapi_dev"; then
+                    log_ok "VAAPI 硬件压缩成功: $(basename "$CURRENT_OUT")"
+                    success=1
+                else
+                    log_warn "VAAPI 硬件压缩失败。"
+                    [ -f "$CURRENT_OUT" ] && rm -f "$CURRENT_OUT"
+                fi
+            else
+                if [ "$DEVICE" != "auto" ]; then
+                    log_err "未找到对应的 $DEVICE 硬件设备。"
+                else
+                    log_info "未检测到可用的 Intel/AMD 核心显卡，跳过 VAAPI。"
+                fi
+            fi
+        else
+            if [ "$DEVICE" = "intel" ] || [ "$DEVICE" = "amdgpu" ]; then
+                log_err "VAAPI 不支持编码格式: $CODEC"
+            fi
+        fi
+    fi
+
+    # 3. 尝试 CPU
+    if [ $success -eq 0 ] && { [ "$DEVICE" = "auto" ] || [ "$DEVICE" = "cpu" ]; }; then
+        if is_codec_supported "cpu" "$CODEC"; then
+            if run_cpu "$f" "$CURRENT_OUT"; then
+                log_ok "CPU 软件压缩成功: $(basename "$CURRENT_OUT")"
+                success=1
+            else
+                log_err "CPU 软件压缩失败。"
+                [ -f "$CURRENT_OUT" ] && rm -f "$CURRENT_OUT"
+            fi
+        else
+            if [ "$DEVICE" = "cpu" ]; then
+                log_err "CPU 软件编码不支持格式: $CODEC"
+            elif [ "$DEVICE" = "auto" ]; then
+                log_err "自动回退失败: 所有的可用硬件/软件设备均不支持编码格式 '$CODEC'"
+            fi
+        fi
+    fi
+
+    if [ $success -eq 0 ]; then
+        log_err "任务失败: $(basename "$f") 无法被成功压缩。"
+    fi
+done
+
+CURRENT_OUT=""
+echo "---------------------------------------------------"
+log_ok "所有列队文件处理完毕。"
+
+# ==========================================
+# 退出暂停逻辑
+# ==========================================
+if [ "$PAUSE_ON_EXIT" -eq 1 ]; then
+    read -n 1 -s -r -p "执行完毕后需按任意键退出..."
+    echo ""
+fi
