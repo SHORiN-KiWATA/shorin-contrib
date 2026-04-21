@@ -42,7 +42,6 @@ if [[ "${1:-}" == "--generate-list" ]]; then
         "$AWK_CMD" "$INSTALLED_LIST" -
 
     # 3. AUR 数据逻辑优化
-    # 判定是否需要刷新：强制刷新 OR 文件不存在 OR 文件过期
     NEED_UPDATE=false
     if [[ "$FORCE_REFRESH" == true ]] || [[ ! -s "$AUR_CACHE" ]]; then
         NEED_UPDATE=true
@@ -57,7 +56,6 @@ if [[ "${1:-}" == "--generate-list" ]]; then
             mv "$TEMP_AUR" "$AUR_CACHE"
         else
             rm -f "$TEMP_AUR"
-            # 下载失败了，如果旧缓存存在，就凑合着用，总比没有强
         fi
     fi
 
@@ -92,7 +90,6 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            # 收集搜索关键字
             QUERY_ARGS+=("$1")
             shift
             ;;
@@ -193,7 +190,22 @@ mkdir -p "$CACHE_DIR"
 
 AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
 AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
-PREVIEW_CMD="$AUR_HELPER -Si {2}"
+
+# 【终极修复预览颜色】
+# 这段 AWK 代码负责准确识别“属性键”（例如 名字 : ），扒掉可能破坏颜色的隐藏 ANSI 码，再给它染上加粗青色。
+AWK_PREVIEW='{
+    if (match($0, /^[ \t]*[^:：]+[:：]/)) {
+        key = substr($0, 1, RLENGTH);
+        val = substr($0, RLENGTH + 1);
+        gsub(/\033\[[0-9;]*[a-zA-Z]/, "", key);
+        print c key r val;
+    } else {
+        print $0;
+    }
+}'
+
+# 必须在 fzf 子进程内独立执行 export LC_ALL，防止被全局 C 环境干扰导致不认中文冒号
+PREVIEW_CMD="export LC_ALL=\"$ORIGINAL_LANG\"; $AUR_HELPER --color=always -Si {2} | awk -v c=\"$(printf '\033[1;36m')\" -v r=\"$(printf '\033[0m')\" '$AWK_PREVIEW'"
 
 cleanup() {
     if [[ -n "${PID_GEN:-}" ]]; then kill "$PID_GEN" 2>/dev/null || true; fi
@@ -246,11 +258,11 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         echo "${PACKAGES[*]}"
         echo "----------------------------------------"
         
-        # 2. 安装前打印 (KISS 哲学)
+        # 2. 安装前静默打印 (KISS 哲学)
         echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
 
-        # 3. 真正执行安装
-        "$AUR_HELPER" -S "${PACKAGES[@]}"
+        # 3. 真正执行安装（此处合并语言环境修复，确保 paru/yay 输出中文）
+        LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" -S "${PACKAGES[@]}"
         
         # 4. 安装结束后留痕，方便复制重试 (KISS 哲学)
         echo "----------------------------------------"

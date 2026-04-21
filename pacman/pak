@@ -14,7 +14,7 @@
 # 启用严格的错误处理机制
 set -euo pipefail
 
-export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells)
+export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells || echo /bin/bash)
 
 # --- 1. 环境与基础配置 ---
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
@@ -50,7 +50,7 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
     MSG[OPT_REFRESH]="  --refresh, -y 强制更新 Flatpak AppStream缓存"
     MSG[FEAT]="功能特性："
-    MSG[FEAT_1]="- 准确状态：自动比对并显示 [已安装] 标记"
+    MSG[FEAT_1]="- 准确状态：自动比堪并显示 [已安装] 标记"
     MSG[FEAT_2]="- 无界排版：清爽的空格对齐，拒绝多余符号"
     MSG[FEAT_3]="- 原生调用：遵循 KISS 原则"
     MSG[EX]="示例："
@@ -186,7 +186,10 @@ COLOR_CYAN=$'\033[36m'
 COLOR_RESET=$'\033[0m'
 FZF_HEADER="${MSG[HEADER]} | ${COLOR_CYAN}Using Flatpak${COLOR_RESET}"
 
-PREVIEW_CMD="line={}; clean=\$(echo \"\$line\" | sed 's/ ✔ .*//'); o=\$(echo \"\$clean\" | awk '{print \$1}'); a=\$(echo \"\$clean\" | awk '{print \$NF}'); flatpak remote-info \"\$o\" \"\$a\""
+# 【关键修复】: 
+# 1. 注入 LC_ALL=$ORIGINAL_LANG 使得预览窗口也显示中文。
+# 2. 因为 flatpak 没有原生色彩支持，通过 awk 手动为包含冒号(:或：) 的 Key 添加 Cyan (\033[36m) 色彩。
+PREVIEW_CMD="line={}; clean=\$(echo \"\$line\" | sed 's/ ✔ .*//'); o=\$(echo \"\$clean\" | awk '{print \$1}'); a=\$(echo \"\$clean\" | awk '{print \$NF}'); LC_ALL=\$ORIGINAL_LANG flatpak remote-info \"\$o\" \"\$a\" | awk '{ sub(/^[ \\t]*[^:：]*[:：]/, \"\\033[36m&\\033[0m\"); print }'"
 
 set +e
 fzf --multi --ansi \
@@ -225,8 +228,8 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         # 2. 安装前静默打印
         echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
 
-        # 3. 真正执行安装
-        flatpak install "${PACKAGES[@]}"
+        # 3. 真正执行安装（【关键修复】：在此恢复语言环境，让安装提示显示中文）
+        LC_ALL="$ORIGINAL_LANG" flatpak install "${PACKAGES[@]}"
 
         # 4. 安装结束后高亮留痕
         echo "----------------------------------------"
