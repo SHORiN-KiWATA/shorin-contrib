@@ -1,5 +1,6 @@
 #!/bin/bash
-# Description: 系统与环境清理脚本
+# 描述： 清理系统
+# Description: Clean system
 
 # 【功能说明】
 # 1. 移除孤儿软件包 (Orphans)

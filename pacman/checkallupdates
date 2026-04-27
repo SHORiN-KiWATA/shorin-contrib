@@ -1,5 +1,6 @@
 #!/bin/bash
-# Description: 检查所有可用的更新
+# 描述： 检查所有待更新软件
+# Description: Check pkg updates
 # ==============================================================================
 # 脚本名称：shorin-check-arch-updates
 # 功能描述：终端下使用 fzf 显示所有待更新的软件包（Pacman, AUR, Flatpak）

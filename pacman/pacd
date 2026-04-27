@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Description: 基于 downgrade 的软件包降级 TUI
+# 描述： 降级软件
+# Description: Downgrade pkgs
 # Features:
 #   1. 模糊搜索已安装软件包并传递给 downgrade 进行版本回退
 #   2. 自动检测系统依赖 (fzf, downgrade, paru/yay)

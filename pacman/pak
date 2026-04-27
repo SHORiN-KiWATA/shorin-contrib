@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Description: Flatpak 软件包模糊搜索与安装 TUI
+# 描述： Flatpak安装软件TUI
+# Description: Flatpak pkgs installation TUI
 # Features:
 #   1. 模糊搜索并批量安装 Flatpak 软件包
 #   2. 自动检测系统并准确标记 [已安装] 的软件包

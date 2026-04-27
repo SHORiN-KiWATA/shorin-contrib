@@ -1,5 +1,6 @@
 #!/bin/bash
-# Description: 更新系统
+# 描述： 更新系统根
+# Description: Update system
 
 # 开启严格模式：遇到错误、未定义变量、管道错误即停止运行
 set -euo pipefail

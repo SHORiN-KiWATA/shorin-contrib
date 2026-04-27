@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Description: 快速存档，创建快照
+# 描述： 快速存档，创建快照
+# Description: Quicksave btrfs snapshots
 # quicksave - Btrfs Snapshot Quick Save Utility
 # (Companion to quickload)
 #

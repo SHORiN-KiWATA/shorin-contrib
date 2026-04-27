@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Description: 简单管理qemu虚拟机
+# 描述： 简单管理KVM虚拟机
+# Description: Quick access KVM Virtual Machines
 # ==============================================================================
 # 功能描述: 仿 impala 风格的 QEMU/KVM 终端仪表盘 (TUI) - 极简稳定版
 # 支持功能:

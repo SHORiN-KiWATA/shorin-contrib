@@ -1,5 +1,6 @@
 #!/bin/bash
-# Description: 更新镜像源
+# 描述： 更新镜像源
+# Description: Update mirrorlist 
 # ==============================================================================
 # Arch Linux Mirror Updater (Optimized & Standardized)
 #

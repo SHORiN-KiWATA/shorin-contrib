@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# 快速搜索AI提供商的可用模型
+# 描述： 快速搜索AI供应商的可用模型
+# Description: Quick search available models from providers 
 """
 AI Model Browser TUI (searchmodels)
 Browse available models from various AI providers.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Description: 卸载软件前识别残留配置文件
+# 描述： 追踪软件的残留文件并卸载
+# Description: Trace files before remove a pkg
 # ==============================================================================
 # 脚本名称: appclean
 # 功能描述:

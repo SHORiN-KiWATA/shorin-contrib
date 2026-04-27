@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Description: Pacman/AUR软件包模糊搜索与安装 TUI
+# 描述： Pacman/AUR安装软件的TUI
+# Description: Pacman/AUR pkg installation TUI 
 # ==============================================================================
 # 启用严格的错误处理机制
 set -euo pipefail
