@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# 描述： 获取文件/目录所有权
+# Description: Get ownership of file or path
+
+# --- 1. 自动检测语言环境 (Locale) ---
+if [[ "${LANG}" == zh_* ]] || [[ "${LC_ALL}" == zh_* ]]; then
+    LANG_CN=true
+else
+    LANG_CN=false
+fi
+
+function get_msg() {
+    local key=$1
+    if $LANG_CN; then
+        case $key in
+            no_args)    echo "错误: 请提供要获取所有权的文件或目录路径。" ;;
+            no_elevate) echo "错误: 系统中未找到 pkexec 或 sudo，无法提权。" ;;
+            dir)        echo "目录" ;;
+            file)       echo "文件" ;;
+            link)       echo "链接" ;;
+            other)      echo "特殊文件" ;;
+            not_found)  echo "路径不存在" ;;
+            success)    echo "成功获取" ;;
+            fail)       echo "操作失败" ;;
+        esac
+    else
+        case $key in
+            no_args)    echo "Error: Please provide file or directory paths." ;;
+            no_elevate) echo "Error: pkexec or sudo not found, cannot elevate." ;;
+            dir)        echo "Directory" ;;
+            file)       echo "File" ;;
+            link)       echo "Symlink" ;;
+            other)      echo "Special" ;;
+            not_found)  echo "Not found" ;;
+            success)    echo "Success" ;;
+            fail)       echo "Failed" ;;
+        esac
+    fi
+}
+
+# 检查参数是否为空
+if [ "$#" -eq 0 ]; then
+    echo "$(get_msg no_args)"
+    exit 1
+fi
+
+# --- 2. 自动检测图形化环境 ---
+HAS_GUI=false
+if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    HAS_GUI=true
+fi
+
+# --- 3. 自动提权机制 (Polkit / Sudo 自动判断与自调用) ---
+if [ "$EUID" -ne 0 ]; then
+    SCRIPT_PATH=$(readlink -f "$0")
+    # 【修复重点】：利用 GETOWN_PWD 透传当前工作目录，防止 pkexec 将目录重置为 /
+    if command -v pkexec >/dev/null 2>&1; then
+        exec pkexec env DISPLAY="$DISPLAY" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" GETOWN_PWD="$PWD" "$SCRIPT_PATH" "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        exec sudo env DISPLAY="$DISPLAY" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" GETOWN_PWD="$PWD" "$SCRIPT_PATH" "$@"
+    else
+        echo "$(get_msg no_elevate)"
+        exit 1
+    fi
+fi
+
+# ===============================================================================
+# 以下代码将在 Root 权限下执行
+# ===============================================================================
+
+# 【修复重点】：拿到 Root 权限后，第一时间恢复到用户执行命令时的目录
+if [ -n "$GETOWN_PWD" ]; then
+    cd "$GETOWN_PWD" || exit 1
+fi
+
+# --- 4. 精准确定真实用户 ---
+if [ -n "$PKEXEC_UID" ]; then
+    REAL_UID="$PKEXEC_UID"
+    REAL_USER=$(id -un "$PKEXEC_UID")
+elif [ -n "$SUDO_USER" ]; then
+    REAL_UID=$(id -u "$SUDO_USER")
+    REAL_USER="$SUDO_USER"
+else
+    REAL_UID=$(id -u)
+    REAL_USER=$(id -un)
+fi
+REAL_GROUP=$(id -gn "$REAL_USER")
+
+SUCCESS_COUNT=0
+FAIL_COUNT=0
+
+echo "======================================"
+echo " Target User  : $REAL_USER (UID: $REAL_UID)"
+echo " Target Group : $REAL_GROUP"
+echo "======================================"
+
+# --- 5. 批量处理与自动分类 ---
+for ITEM in "$@"; do
+    if [ ! -e "$ITEM" ]; then
+        echo "[✘ $(get_msg not_found)] $ITEM"
+        continue
+    fi
+
+    # 自动检测分类
+    if [ -h "$ITEM" ]; then
+        TYPE="$(get_msg link)"
+    elif [ -d "$ITEM" ]; then
+        TYPE="$(get_msg dir)"
+    elif [ -f "$ITEM" ]; then
+        TYPE="$(get_msg file)"
+    else
+        TYPE="$(get_msg other)"
+    fi
+
+    # 核心操作：递归修改所有权
+    if chown -R "${REAL_USER}:${REAL_GROUP}" "$ITEM"; then
+        echo "[✔ $(get_msg success)] ($TYPE) $ITEM"
+        ((SUCCESS_COUNT++))
+    else
+        echo "[✘ $(get_msg fail)] ($TYPE) $ITEM"
+        ((FAIL_COUNT++))
+    fi
+done
+
+# --- 6. 桌面气泡通知 ---
+if $HAS_GUI && command -v notify-send >/dev/null 2>&1; then
+    if $LANG_CN; then
+        MSG_TITLE="获取所有权完成"
+        MSG_BODY="成功: $SUCCESS_COUNT 个项目\n失败: $FAIL_COUNT 个项目"
+    else
+        MSG_TITLE="Ownership Transfer Complete"
+        MSG_BODY="Success: $SUCCESS_COUNT item(s)\nFailed: $FAIL_COUNT item(s)"
+    fi
+    
+    sudo -u "$REAL_USER" \
+         DISPLAY="$DISPLAY" \
+         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${REAL_UID}/bus" \
+         notify-send -a "Getown" -i dialog-information "$MSG_TITLE" "$MSG_BODY" >/dev/null 2>&1 || true
+fi
