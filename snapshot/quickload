@@ -37,7 +37,12 @@ if [[ "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" =~ zh_CN ]]; then
     MSG_OPT_ROOT="仅恢复系统目录 (root)"
     MSG_OPT_HOME="仅恢复用户目录 (home)"
     MSG_OPT_ONLY="仅恢复 %s"
+    MSG_OPT_SELECT="自选读档节点"
     MSG_OPT_CANCEL="取消操作"
+    MSG_SELECT_TITLE="选择读档节点"
+    MSG_SELECT_BACK="返回快速读档菜单"
+    MSG_SELECT_EMPTY="未找到可用于回档的快照。"
+    MSG_SELECT_FMT="%s [ID: %s | 时间: %s]"
     
     MSG_LIST_CONF="=== 可用的快照配置 ==="
     MSG_LIST_CUSTOM="=== 可用的自定义快照描述 ==="
@@ -82,7 +87,12 @@ else
     MSG_OPT_ROOT="Restore System Config (root)"
     MSG_OPT_HOME="Restore User Config (home)"
     MSG_OPT_ONLY="Restore %s"
+    MSG_OPT_SELECT="Select Restore Snapshot"
     MSG_OPT_CANCEL="Cancel Operation"
+    MSG_SELECT_TITLE="Select Restore Snapshot"
+    MSG_SELECT_BACK="Back to Quickload Menu"
+    MSG_SELECT_EMPTY="No restorable snapshots found."
+    MSG_SELECT_FMT="%s [ID: %s | Date: %s]"
     
     MSG_LIST_CONF="=== Available Snapshot Configurations ==="
     MSG_LIST_CUSTOM="=== Available Custom Snapshot Descriptions ==="
@@ -331,12 +341,12 @@ list_snapshot_descriptions() {
     for conf in "${configs_to_list[@]}"; do
         local list_out
         list_out=$(get_snapper_list_output "$conf")
-        
+
         while IFS='|' read -r sid date desc; do
             desc="${desc#"${desc%%[![:space:]]*}"}"; desc="${desc%"${desc##*[![:space:]]}"}"
             date="${date#"${date%%[![:space:]]*}"}"; date="${date%"${date##*[![:space:]]}"}"
             sid="${sid#"${sid%%[![:space:]]*}"}"; sid="${sid%"${sid##*[![:space:]]}"}"
-            
+
             if [[ -z "$desc" || "$desc" == "Description" || "$desc" == "描述" || "$desc" == "current" ]]; then
                 continue
             fi
@@ -383,6 +393,111 @@ get_snap_id_by_desc() {
     local conf="$1"; local desc="$2"; local list_out
     list_out=$(get_snapper_list_output "$conf")
     echo "$list_out" | awk -F' *[|│] *' -v d="$desc" 'NR>2 && $7 == d {print $1}' | tail -n 1 || true
+}
+
+select_menu_choice() {
+    local result_var="$1"
+    local menu_title="$2"
+    local menu_wide="$3"
+    shift 3
+    local menu_opts=("$@")
+    local choice=""
+    local user_input=""
+
+    if [[ -t 0 && -t 1 ]]; then
+        echo "=== $menu_title ==="
+        for i in "${!menu_opts[@]}"; do
+            printf "  %d) %s\n" "$((i + 1))" "${menu_opts[$i]}"
+        done
+        while true; do
+            read -p "$MSG_PROMPT" user_input
+            if [[ "$user_input" =~ ^[0-9]+$ ]] && (( user_input > 0 && user_input <= ${#menu_opts[@]} )); then
+                choice="${menu_opts[$((user_input - 1))]}"
+                break
+            else
+                echo "$MSG_INVALID"
+            fi
+        done
+    else
+        local opts_str
+        local fuzzel_args=(--dmenu --prompt="$menu_title > ")
+        local wofi_args=(--dmenu --prompt="$menu_title")
+        local rofi_args=(-dmenu -p "$menu_title")
+        local zenity_args=(--list --title="$menu_title" --column="选项" --hide-header)
+
+        if [[ "$menu_wide" == 1 ]]; then
+            fuzzel_args+=(--width=60)
+            wofi_args+=(--width=900)
+            rofi_args+=(-width 90)
+            zenity_args+=(--width=900)
+        fi
+
+        opts_str=$(printf "%s\n" "${menu_opts[@]}")
+        if command -v fuzzel >/dev/null 2>&1; then
+            choice=$(printf "%s\n" "$opts_str" | run_as_user fuzzel "${fuzzel_args[@]}" 2>/dev/null || true)
+        elif command -v wofi >/dev/null 2>&1; then
+            choice=$(printf "%s\n" "$opts_str" | run_as_user wofi "${wofi_args[@]}" 2>/dev/null || true)
+        elif command -v rofi >/dev/null 2>&1; then
+            choice=$(printf "%s\n" "$opts_str" | run_as_user rofi "${rofi_args[@]}" 2>/dev/null || true)
+        elif command -v zenity >/dev/null 2>&1; then
+            choice=$(printf "%s\n" "$opts_str" | run_as_user zenity "${zenity_args[@]}" 2>/dev/null || true)
+        fi
+    fi
+
+    printf -v "$result_var" '%s' "$choice"
+}
+
+choose_restore_snapshot() {
+    local descs_raw=()
+    local snapshot_menu_opts=()
+    local snapshot_choice=""
+    local entry desc conf sid date label list_out
+    local sorted_descs=()
+    local -A snapshot_choice_map
+
+    if [[ -n "${CONFIG_MAP["root"]:-}" ]]; then
+        conf="root"
+    else
+        for conf in "${!CONFIG_MAP[@]}"; do break; done
+    fi
+
+    list_out=$(get_snapper_list_output "$conf")
+    while IFS='|' read -r sid date desc; do
+        desc="${desc#"${desc%%[![:space:]]*}"}"; desc="${desc%"${desc##*[![:space:]]}"}"
+        date="${date#"${date%%[![:space:]]*}"}"; date="${date%"${date##*[![:space:]]}"}"
+        sid="${sid#"${sid%%[![:space:]]*}"}"; sid="${sid%"${sid##*[![:space:]]}"}"
+        if [[ -z "$desc" || "$desc" == "Description" || "$desc" == "描述" || "$desc" == "current" ]]; then
+            continue
+        fi
+        descs_raw+=("$desc|$sid|$date")
+    done < <(echo "$list_out" | awk -F' *[|│] *' 'NR>2 {print $1 "|" $4 "|" $7}')
+
+    if [[ ${#descs_raw[@]} -eq 0 ]]; then
+        notify_err "$MSG_SELECT_EMPTY"
+        return 1
+    fi
+
+    readarray -t sorted_descs < <(printf "%s\n" "${descs_raw[@]}" | sort -t'|' -k2,2n)
+    for entry in "${sorted_descs[@]}"; do
+        IFS='|' read -r desc sid date <<< "$entry"
+        label=$(printf "$MSG_SELECT_FMT" "$desc" "$sid" "$date")
+        snapshot_menu_opts+=("$label")
+        snapshot_choice_map["$label"]="$desc"
+    done
+    snapshot_menu_opts+=("$MSG_SELECT_BACK")
+
+    select_menu_choice snapshot_choice "$MSG_SELECT_TITLE" 1 "${snapshot_menu_opts[@]}"
+    if [[ -z "$snapshot_choice" || "$snapshot_choice" == "$MSG_SELECT_BACK" ]]; then
+        return 1
+    fi
+
+    if [[ -n "${snapshot_choice_map[$snapshot_choice]:-}" ]]; then
+        OPT_DESC="${snapshot_choice_map[$snapshot_choice]}"
+        TARGET_DESC="$OPT_DESC"
+    else
+        notify_err "$MSG_UNKNOWN_CHOICE" "$snapshot_choice"
+        return 1
+    fi
 }
 
 get_btrfs_subvol_name() {
@@ -486,67 +601,47 @@ fi
 # ==========================================
 # 交互式 UI 菜单生成 (普通用户侧执行)
 # ==========================================
-MENU_TITLE="$MSG_TITLE"
-[[ -n "$TARGET_DESC" ]] && MENU_TITLE="$MSG_TITLE [$TARGET_DESC]"
-
 declare -A CHOICE_MAP
-MENU_OPTS=("$MSG_OPT_BOTH")
-CHOICE_MAP["$MSG_OPT_BOTH"]="all"
 
-for conf in "${!CONFIG_MAP[@]}"; do
-    if [[ "$conf" == "root" ]]; then
-        MENU_OPTS+=("$MSG_OPT_ROOT")
-        CHOICE_MAP["$MSG_OPT_ROOT"]="root"
-    elif [[ "$conf" == "home" ]]; then
-        MENU_OPTS+=("$MSG_OPT_HOME")
-        CHOICE_MAP["$MSG_OPT_HOME"]="home"
-    else
-        opt_str="$(printf "$MSG_OPT_ONLY" "$conf")"
-        MENU_OPTS+=("$opt_str")
-        CHOICE_MAP["$opt_str"]="$conf"
-    fi
-done
+while true; do
+    MENU_TITLE="$MSG_TITLE"
+    [[ -n "$TARGET_DESC" ]] && MENU_TITLE="$MSG_TITLE [$TARGET_DESC]"
 
-MENU_OPTS+=("$MSG_OPT_CANCEL")
-CHOICE_MAP["$MSG_OPT_CANCEL"]="cancel"
-CHOICE=""
+    CHOICE_MAP=()
+    MENU_OPTS=("$MSG_OPT_BOTH")
+    CHOICE_MAP["$MSG_OPT_BOTH"]="all"
 
-if [[ -t 0 && -t 1 ]]; then
-    echo "=== $MENU_TITLE ==="
-    for i in "${!MENU_OPTS[@]}"; do
-        printf "  %d) %s\n" "$((i + 1))" "${MENU_OPTS[$i]}"
-    done
-    
-    while true; do
-        read -p "$MSG_PROMPT" user_input
-        if [[ "$user_input" =~ ^[0-9]+$ ]] && (( user_input > 0 && user_input <= ${#MENU_OPTS[@]} )); then
-            CHOICE="${MENU_OPTS[$((user_input - 1))]}"
-            break
+    for conf in "${!CONFIG_MAP[@]}"; do
+        if [[ "$conf" == "root" ]]; then
+            MENU_OPTS+=("$MSG_OPT_ROOT")
+            CHOICE_MAP["$MSG_OPT_ROOT"]="root"
+        elif [[ "$conf" == "home" ]]; then
+            MENU_OPTS+=("$MSG_OPT_HOME")
+            CHOICE_MAP["$MSG_OPT_HOME"]="home"
         else
-            echo "$MSG_INVALID"
+            opt_str="$(printf "$MSG_OPT_ONLY" "$conf")"
+            MENU_OPTS+=("$opt_str")
+            CHOICE_MAP["$opt_str"]="$conf"
         fi
     done
-else
-    # 彻底解决主题问题：由于此时绝大概率尚未提权，Fuzzel/Wofi 跑的本来就是当前用户，主题完美复现！
-    # 即使在快照环境里跑成了 root，也能通过 run_as_user 降权读回主题。
-    OPTS_STR=$(printf "%s\n" "${MENU_OPTS[@]}")
-    if command -v fuzzel >/dev/null 2>&1; then
-        CHOICE=$(echo -e "$OPTS_STR" | run_as_user fuzzel --dmenu --prompt="$MENU_TITLE > " 2>/dev/null || true)
-    elif command -v wofi >/dev/null 2>&1; then
-        CHOICE=$(echo -e "$OPTS_STR" | run_as_user wofi --dmenu --prompt="$MENU_TITLE" 2>/dev/null || true)
-    elif command -v rofi >/dev/null 2>&1; then
-        CHOICE=$(echo -e "$OPTS_STR" | run_as_user rofi -dmenu -p "$MENU_TITLE" 2>/dev/null || true)
-    elif command -v zenity >/dev/null 2>&1; then
-        CHOICE=$(echo -e "$OPTS_STR" | run_as_user zenity --list --title="$MENU_TITLE" --column="选项" --hide-header 2>/dev/null || true)
+
+    MENU_OPTS+=("$MSG_OPT_SELECT")
+    CHOICE_MAP["$MSG_OPT_SELECT"]="select_snapshot"
+    MENU_OPTS+=("$MSG_OPT_CANCEL")
+    CHOICE_MAP["$MSG_OPT_CANCEL"]="cancel"
+    CHOICE=""
+
+    select_menu_choice CHOICE "$MENU_TITLE" 0 "${MENU_OPTS[@]}"
+    [[ -z "$CHOICE" ]] && exit 0
+    SELECTION="${CHOICE_MAP["$CHOICE"]:-}"
+
+    if [[ "$SELECTION" == "select_snapshot" ]]; then
+        choose_restore_snapshot || true
+        continue
+    elif [[ -n "$SELECTION" ]]; then
+        execute_restore "$SELECTION"
+    else
+        notify_err "$MSG_UNKNOWN_CHOICE" "$CHOICE"
+        exit 1
     fi
-fi
-
-[[ -z "$CHOICE" ]] && exit 0
-SELECTION="${CHOICE_MAP["$CHOICE"]:-}"
-
-if [[ -n "$SELECTION" ]]; then
-    execute_restore "$SELECTION"
-else
-    notify_err "$MSG_UNKNOWN_CHOICE" "$CHOICE"
-    exit 1
-fi
+done
