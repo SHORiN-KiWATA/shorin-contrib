@@ -477,7 +477,7 @@ choose_restore_snapshot() {
         return 1
     fi
 
-    readarray -t sorted_descs < <(printf "%s\n" "${descs_raw[@]}" | sort -t'|' -k2,2n)
+    readarray -t sorted_descs < <(printf "%s\n" "${descs_raw[@]}" | sort -t'|' -k2,2nr)
     for entry in "${sorted_descs[@]}"; do
         IFS='|' read -r desc sid date <<< "$entry"
         label=$(printf "$MSG_SELECT_FMT" "$desc" "$sid" "$date")
