@@ -370,6 +370,23 @@ PYTHON_SCRIPT=$(
 import sys
 import xml.etree.ElementTree as ET
 try:
+    def clean_text(value):
+        value = value or ''
+        return ''.join(
+            ch for ch in value.strip()
+            if ord(ch) >= 32 and not 127 <= ord(ch) <= 159
+        )
+
+    def item_text(item, tag):
+        element = item.find(tag)
+        return clean_text(element.text if element is not None else '')
+
+    def terminal_link(text, url):
+        url = clean_text(url)
+        if not url:
+            return text
+        return f'\033]8;;{url}\033\\{text}\033]8;;\033\\'
+
     limit = int(sys.argv[1])
     header_template = sys.argv[2]
     sys.stdin.reconfigure(encoding='utf-8')
@@ -379,15 +396,17 @@ try:
     items = root.findall('./channel/item')[:limit]
     print(f'\n\033[1;33m{header_template.format(len(items))}\033[0m\n')
     for item in items:
-        title = item.find('title').text
-        pub_date = item.find('pubDate').text
-        date_str = pub_date[:16]
+        title = item_text(item, 'title') or '(untitled)'
+        pub_date = item_text(item, 'pubDate')
+        link = item_text(item, 'link')
+        date_str = pub_date[:16] if pub_date else 'No date'
         check_text = title.lower()
         if any(x in check_text for x in ['intervention', 'manual', '手动', '干预']):
             color = '\033[1;31m'; prefix = '!!! '
         else:
             color = '\033[1;32m'; prefix = ''
-        print(f'{color}[{date_str}] {prefix}{title}\033[0m')
+        line = f'[{date_str}] {prefix}{title}'
+        print(f'{color}{terminal_link(line, link)}\033[0m')
 except Exception as e:
     sys.stderr.write(f'\nParse Error: {e}\n')
     sys.exit(1)
