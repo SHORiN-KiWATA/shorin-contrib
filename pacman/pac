@@ -753,14 +753,19 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
         fi
 
         if [[ ${#AUR_UNREVIEWED[@]} -gt 0 ]]; then
-            FINAL_CMD="$AUR_HELPER -Sa ${AUR_UNREVIEWED[*]}"
+            AUR_INSTALL_ARGS=(-Sa)
+            if [[ "$AUR_HELPER" == "paru" ]]; then
+                AUR_INSTALL_ARGS+=(--skipreview)
+            fi
+            AUR_INSTALL_ARGS+=("${AUR_UNREVIEWED[@]}")
+            FINAL_CMD="$AUR_HELPER ${AUR_INSTALL_ARGS[*]}"
 
             echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
             echo "${AUR_UNREVIEWED[*]}"
             echo "----------------------------------------"
             echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
 
-            LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" -Sa "${AUR_UNREVIEWED[@]}"
+            LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" "${AUR_INSTALL_ARGS[@]}"
 
             echo "----------------------------------------"
             echo -e "\033[36m${MSG[HINT]}\033[0m"
