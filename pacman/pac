@@ -76,7 +76,18 @@ SHOW_HELP=false
 FORCE_REFRESH=false
 CHECK_ONLY=false
 QUERY_ARGS=()
-OPENCODE_MODEL="${PAC_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pac_tui"
+MODEL_CACHE="${CACHE_DIR}/opencode_model"
+OPENCODE_MODEL="opencode/deepseek-v4-flash-free"
+if [[ -r "$MODEL_CACHE" ]]; then
+    read -r CACHED_OPENCODE_MODEL < "$MODEL_CACHE" || true
+    if [[ -n "${CACHED_OPENCODE_MODEL:-}" ]]; then
+        OPENCODE_MODEL="$CACHED_OPENCODE_MODEL"
+    fi
+fi
+if [[ -n "${PAC_OPENCODE_MODEL:-}" ]]; then
+    OPENCODE_MODEL="$PAC_OPENCODE_MODEL"
+fi
 
 # 获取脚本自身的绝对路径，确保在 fzf 子进程 reload 时能准确自我调用
 SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
@@ -274,7 +285,6 @@ INSTALLED_LIST="${TMP_DIR}/installed"
 PIPE_FIFO="${TMP_DIR}/fifo"
 mkfifo "$PIPE_FIFO"
 
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pac_tui"
 mkdir -p "$CACHE_DIR"
 
 AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
@@ -439,6 +449,8 @@ select_review_model() {
 
     if [[ -n "$selected" ]]; then
         OPENCODE_MODEL="$selected"
+        mkdir -p "$CACHE_DIR"
+        printf '%s\n' "$OPENCODE_MODEL" > "$MODEL_CACHE"
         echo -e "\033[36m${MSG[MODEL_SELECTED]}\033[0m $OPENCODE_MODEL"
     fi
 }
