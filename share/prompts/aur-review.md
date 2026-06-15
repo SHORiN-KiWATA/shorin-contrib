@@ -6,6 +6,7 @@ pac already selected the exact AUR package and AUR helper. The user message prov
 
 - `AUR_HELPER`: the exact helper command, usually `paru` or `yay`
 - `PKG`: the exact AUR package name
+- `AUR_BUILD_DIR`: the local directory containing AUR build files already fetched by pac using the AUR helper. opencode is launched with this directory as the current working directory.
 
 Do not detect helpers. Do not search for packages. Do not compare package sources. Do not ask the user whether to continue. Do not install, build, upgrade, remove, or run any command equivalent to `$AUR_HELPER -S`, `$AUR_HELPER -Sa`, `paru -S`, `yay -S`, `makepkg`, `pacman -U`, or `sudo pacman`.
 
@@ -17,7 +18,7 @@ Security posture: strict by default. If the review cannot bound what code will b
 
 ### Step 1: Gather Information
 
-Use the provided `AUR_HELPER` and `PKG`. Gather these three sources of information:
+Use the provided `AUR_HELPER`, `PKG`, and `AUR_BUILD_DIR`. opencode is already running inside `AUR_BUILD_DIR`, so review local files with relative paths from the current working directory.
 
 ```bash
 $AUR_HELPER -Si $PKG
@@ -44,32 +45,40 @@ From AUR RPC, extract at least:
 - Depends
 - MakeDepends
 
+Read the local build files from the current working directory. Do not fetch PKGBUILD or accompanying files from AUR cgit, AUR snapshot, or AUR plain URLs. pac already fetched the build files with the selected AUR helper before invoking this review.
+
+Required local reads:
+
 ```bash
-$AUR_HELPER -Gp $PKG
+ls -la
 ```
 
-### Step 2: Fetch Additional Files
+```bash
+read PKGBUILD
+```
 
-Check the PKGBUILD for references to additional files and fetch them. These files may be executed during build, included in the package, or run by pacman install hooks, so they MUST be reviewed.
+### Step 2: Read Additional Local Files
+
+Check the PKGBUILD for references to additional local files. These files may be executed during build, included in the package, or run by pacman install hooks, so they MUST be reviewed.
 
 If PKGBUILD contains `install=<filename>`:
 
 ```bash
-curl -sL "https://aur.archlinux.org/cgit/aur.git/plain/<install_filename>?h=<PackageBase>"
+read <install_filename>
 ```
 
-Where `<PackageBase>` comes from AUR RPC, and `<install_filename>` is the value of the `install=` line.
+Where `<install_filename>` is the value of the `install=` line.
 
 If PKGBUILD references patch files, systemd units, helper scripts, or other local files in `source=()`:
 
 ```bash
-curl -sL "https://aur.archlinux.org/cgit/aur.git/snapshot/<PackageBase>.tar.gz" | tar tzf -
+find . -maxdepth 2 -type f
 ```
 
-Then fetch any `.sh`, `.patch`, `.service`, `.timer`, `.socket`, `.desktop`, sysusers, tmpfiles, executable/config files, or other local files that affect build or install behavior:
+Then read any `.sh`, `.patch`, `.service`, `.timer`, `.socket`, `.desktop`, sysusers, tmpfiles, executable/config files, or other local files that affect build or install behavior:
 
 ```bash
-curl -sL "https://aur.archlinux.org/cgit/aur.git/plain/<filename>?h=<PackageBase>"
+read <filename>
 ```
 
 ### Step 3: Security Review
