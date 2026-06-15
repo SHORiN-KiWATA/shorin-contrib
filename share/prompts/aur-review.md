@@ -219,7 +219,28 @@ Required structure:
 
 1. `## PKGBUILD意图` — 1-3 sentences: what the package does, how it builds, trust anchor (upstream identity)
 2. `## 具体风险` — each item is one line: `🟡 risk point + why it is risky`; optional blockquote for code evidence
-3. `## 🟢/🟡/🔴 <PKG> 审查结果：<风险等级>` — risk level as a heading, followed by 1-3 bullet recommendations (including the primary action like "建议取消安装" as the first bullet)
+3. `## 🟢/🟡/🔴 <PKG> 审查结果：<风险等级>` — risk level as a heading, followed by 1-3 bullet recommendations.
+4. After the Markdown report, output exactly one machine-readable decision line in English JSON.
+
+Controlled first recommendation bullet, choose exactly one:
+
+- `- 建议可继续安装`
+- `- 建议谨慎安装`
+- `- 建议取消安装`
+
+Machine-readable decision line format:
+
+```text
+PAC_DECISION: {"risk":"low|medium|high","install_default":"yes|no"}
+```
+
+Decision rules:
+
+- `risk` must match the report heading risk level.
+- `install_default` must be `yes` only when your primary recommendation is to continue installing.
+- `install_default` must be `no` when your primary recommendation is cautious install or cancel install.
+- Do not localize JSON keys or values.
+- The `PAC_DECISION` line is mandatory. Never omit it.
 
 Brevity rules:
 
@@ -227,7 +248,7 @@ Brevity rules:
 - Do NOT add a standalone `核心原因` line, `风险叠加导致高风险` item, or `影响：`/`风险原因：` labels. These are conclusions, not concrete risks.
 - Do not mention positive context unless it changes the risk level.
 - Do not report VCS `SKIP` checksums as a risk; that is normal for VCS sources.
-- `## 建议` bullets merged into the review result section. First bullet is the primary action, followed by 0-2 additional steps.
+- `## 建议` bullets merged into the review result section. First bullet is the primary action and must use one of the controlled phrases exactly, followed by 0-2 additional steps.
 - PKGBUILD意图 covers what the package does, how it builds (source compile / binary repack / VCS / language ecosystem build), and trust anchor (who is the upstream, is it verified).
 
 If no findings at all:
@@ -236,7 +257,8 @@ If no findings at all:
 <1-3 sentences: what/how/trust>
 
 ## 🟢 <PKG> 审查结果：低风险
-- 建议可继续
+- 建议可继续安装
+PAC_DECISION: {"risk":"low","install_default":"yes"}
 
 If findings exist:
 
@@ -253,6 +275,7 @@ If findings exist:
 ## 🟢/🟡/🔴 <PKG> 审查结果：<风险等级>
 - <primary action recommendation>
 - <additional step, if any>
+PAC_DECISION: {"risk":"low|medium|high","install_default":"yes|no"}
 
 Example output:
 
@@ -273,6 +296,7 @@ Example output:
 - 建议取消安装
 - 如必须安装，先核实 GitHub 仓库是否为官方上游
 - 优先选择已验证来源或预编译仓库包
+PAC_DECISION: {"risk":"high","install_default":"no"}
 
 ## Risk Level Criteria
 
@@ -296,7 +320,20 @@ Explicit escalation rules:
 8. Unverified or unusual upstream identity alone is `中风险`; escalate to `高风险` only when paired with weak/missing integrity, suspicious hosting, clear brandjacking, orphan/recent adoption, install-time behavior, or executable dependency/network risk.
 9. Binary blob, unusual upstream identity, and low AUR votes often describe the same trust boundary. Do not count them as three independent domains by themselves. With strong checksum, HTTPS GitHub release, no `.install`, no build-time execution, and no suspicious install behavior, classify this combination as `中风险`.
 10. If the review cannot determine the final code that will execute because of non-VCS network/dependency execution, choose the higher risk level and say why.
+11. Community-trust downgrade rule: if the only concrete finding is bounded build-time dependency fetching, and all of the following are true, classify as `低风险` with an informational note instead of `中风险`: upstream identity is clear and matches the package, AUR votes/popularity are high, the package has a long maintenance history, it is not orphaned or out-of-date, dependencies are locked by a lockfile or equivalent, and there is no `.install` risk, persistence, obfuscation, credential access, data exfiltration, binary blob, weak/missing integrity, or writes outside `$pkgdir`.
+12. Do not apply the community-trust downgrade to lifecycle-hook package managers (`npm install`, `bun install`, `pip install` from sdists, `gem install`, `cargo install`), `.install` network access, binary blob repackaging, unverified upstream identity, orphan/recent adoption, or malicious-like behavior.
+13. For well-known AUR infrastructure packages such as `paru`, if the only finding is `cargo fetch --locked` / locked Rust dependency fetching, and the package has high votes/popularity, clear upstream identity, strong source checksum, and no `.install` or suspicious behavior, classify as `低风险`. Do not put this bounded dependency fetch in `## 具体风险`; mention it briefly in `PKGBUILD意图` or an additional recommendation if useful.
 
-After outputting the report, stop. Do not ask follow-up questions. Do not install.
+Example for a high-trust Rust package with only locked cargo dependency fetching:
 
-The final line of the response MUST be one of the recommendation bullets under the review result heading. Do not write any text after that final recommendation bullet. In particular, do not add `审查完成`, `总结`, `原因`, `按规则`, or any explanatory paragraph after the report.
+## PKGBUILD意图
+从明确上游 GitHub 仓库下载 Rust 源码 tarball，通过 cargo 构建 AUR 工具。构建期会按 Cargo.lock 拉取 crates.io 依赖，但上游身份清晰、社区验证高、源码校验完整且无安装脚本。
+
+## 🟢 paru 审查结果：低风险
+- 建议可继续安装
+- 如需进一步降低供应链风险，可在干净 chroot 中构建
+PAC_DECISION: {"risk":"low","install_default":"yes"}
+
+After outputting the report and the `PAC_DECISION` line, stop. Do not ask follow-up questions. Do not install.
+
+The final line of the response MUST be the `PAC_DECISION` line. Do not write any text after it. In particular, do not add `审查完成`, `总结`, `原因`, `按规则`, or any explanatory paragraph after the decision line.

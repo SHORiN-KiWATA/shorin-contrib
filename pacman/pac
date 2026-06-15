@@ -295,17 +295,13 @@ extract_review_report() {
     local report_file="$2"
 
     sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$log_file" | awk '
-        /<system-reminder>/ {
-            skip = 1
-            next
-        }
-        skip {
-            if (/<\/system-reminder>/) {
-                skip = 0
-            }
-            next
-        }
+        /<system-reminder>/ { skip = 1; next }
+        /<\/system-reminder>/ { skip = 0; next }
+        skip { next }
         /^The final line of the response MUST be/ {
+            next
+        }
+        /^PAC_DECISION:/ {
             next
         }
         /^## PKGBUILD意图/ {
@@ -335,14 +331,47 @@ is_risky_review() {
 
 review_risk_label() {
     local report_file="$1"
+    local decision_file="${2:-}"
 
-    if grep -Fq '审查结果：高风险' "$report_file" || grep -Fq '## 🔴' "$report_file"; then
+    if [[ -n "$decision_file" ]] && sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$decision_file" | grep -Eq '^PAC_DECISION:.*"risk"[[:space:]]*:[[:space:]]*"high"'; then
+        printf '%s' "${MSG[INSTALL_RISK_HIGH]}"
+    elif [[ -n "$decision_file" ]] && sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$decision_file" | grep -Eq '^PAC_DECISION:.*"risk"[[:space:]]*:[[:space:]]*"medium"'; then
+        printf '%s' "${MSG[INSTALL_RISK_MEDIUM]}"
+    elif [[ -n "$decision_file" ]] && sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$decision_file" | grep -Eq '^PAC_DECISION:.*"risk"[[:space:]]*:[[:space:]]*"low"'; then
+        printf '%s' "${MSG[INSTALL_RISK_LOW]}"
+    elif grep -Fq '审查结果：高风险' "$report_file" || grep -Fq '## 🔴' "$report_file"; then
         printf '%s' "${MSG[INSTALL_RISK_HIGH]}"
     elif grep -Fq '审查结果：中风险' "$report_file" || grep -Fq '## 🟡' "$report_file"; then
         printf '%s' "${MSG[INSTALL_RISK_MEDIUM]}"
     else
         printf '%s' "${MSG[INSTALL_RISK_LOW]}"
     fi
+}
+
+review_recommends_install() {
+    local report_file="$1"
+    local decision_file="${2:-}"
+
+    if [[ -n "$decision_file" ]] && sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$decision_file" | grep -Eq '^PAC_DECISION:.*"install_default"[[:space:]]*:[[:space:]]*"yes"'; then
+        return 0
+    fi
+
+    grep -Fq -- '- 建议可继续安装' "$report_file" || \
+    grep -Fq -- '- 建议继续安装' "$report_file" || \
+    grep -Fq -- '- 建议可继续' "$report_file" || \
+    grep -Eiq -- '- .*continue (installing|installation)' "$report_file"
+}
+
+review_recommends_cancel() {
+    local report_file="$1"
+    local decision_file="${2:-}"
+
+    if [[ -n "$decision_file" ]] && sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$decision_file" | grep -Eq '^PAC_DECISION:.*"install_default"[[:space:]]*:[[:space:]]*"no"'; then
+        return 0
+    fi
+
+    grep -Fq -- '- 建议谨慎安装' "$report_file" || \
+    grep -Fq -- '- 建议取消安装' "$report_file"
 }
 
 aur_build_dir() {
@@ -364,9 +393,9 @@ fetch_aur_build_files() {
     mkdir -p "$build_root"
 
     if [[ "$AUR_HELPER" == "paru" ]]; then
-        LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --clonedir "$build_root" --redownload -G "$pkg"
+        LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --clonedir "$build_root" --redownload -G "$pkg"
     else
-        (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --redownload -G "$pkg")
+        (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --redownload -G "$pkg")
     fi
 }
 
@@ -522,8 +551,10 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
                     "$REVIEW_MESSAGE" 2>&1 | tee "$REVIEW_LOG" | awk '
                         BEGIN { gray="\033[90m"; reset="\033[0m"; report=0 }
                         /<system-reminder>/ { skip=1; next }
-                        skip { if (/<\/system-reminder>/) skip=0; next }
+                        /<\/system-reminder>/ { skip=0; next }
+                        skip { next }
                         /^The final line of the response MUST be/ { next }
+                        /^PAC_DECISION:/ { next }
                         /^## PKGBUILD意图/ { report=1 }
                         { if (report) print; else print gray $0 reset }
                     '
@@ -555,8 +586,26 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
 
                 answer=""
                 echo -e "\033[90m-----------------------------------\033[0m"
-                if is_risky_review "$REVIEW_REPORT"; then
-                    risk_label=$(review_risk_label "$REVIEW_REPORT")
+                if review_recommends_install "$REVIEW_REPORT" "$REVIEW_LOG"; then
+                    risk_label=$(review_risk_label "$REVIEW_REPORT" "$REVIEW_LOG")
+                    echo -e "\n\033[35m╭─ ${risk_label}\033[0m"
+                    echo -e "\033[35m│\033[0m  ${MSG[INSTALL_RISK_HINT]}"
+                    printf "\033[35m╰─\033[0m [Y/n] "
+                    read -r answer || answer="n"
+                    case "${answer:-Y}" in
+                        y|Y|yes|YES)
+                            AUR_REVIEWED+=("$pkg")
+                            ;;
+                        *)
+                            echo -e "\033[33m${MSG[SKIPPED]}\033[0m $pkg"
+                            ;;
+                    esac
+                    rm -f "$REVIEW_LOG" "$REVIEW_REPORT"
+                    continue
+                fi
+
+                if review_recommends_cancel "$REVIEW_REPORT" "$REVIEW_LOG" || is_risky_review "$REVIEW_REPORT"; then
+                    risk_label=$(review_risk_label "$REVIEW_REPORT" "$REVIEW_LOG")
                     echo -e "\n\033[35m╭─ ${risk_label}\033[0m"
                     echo -e "\033[35m│\033[0m  ${MSG[INSTALL_RISK_HINT]}"
                     printf "\033[35m╰─\033[0m [y/N] "
@@ -573,7 +622,7 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
                     continue
                 fi
 
-                risk_label=$(review_risk_label "$REVIEW_REPORT")
+                risk_label=$(review_risk_label "$REVIEW_REPORT" "$REVIEW_LOG")
                 echo -e "\n\033[35m╭─ ${risk_label}\033[0m"
                 echo -e "\033[35m│\033[0m  ${MSG[INSTALL_RISK_HINT]}"
                 printf "\033[35m╰─\033[0m [Y/n] "
