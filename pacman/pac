@@ -140,6 +140,12 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
+    MSG[ASK_INSTALL_YAY]="未检测到 AUR 助手，是否立即安装 yay？ [Y/n] "
+    MSG[INSTALLING_YAY]=">> 正在安装 yay，需要 sudo 权限，请按提示操作..."
+    MSG[YAY_INSTALL_OK]=">> yay 安装成功，继续执行。"
+    MSG[YAY_INSTALL_FAIL]="错误：yay 安装失败，请手动安装后重试。"
+    MSG[ERR_NO_GIT]="错误：未找到 git，安装 yay 需要 git。请先执行：sudo pacman -S git"
+    MSG[ERR_NO_BASE_DEVEL]="错误：缺少 base-devel 组，构建 yay 需要它。请先执行：sudo pacman -S base-devel"
     MSG[INSTALLED]="[已安装]"
     MSG[INSTALLING]=">> 准备安装："
     MSG[HEADER]="Tab:多选 | Enter:安装 | Ctrl+R:强制刷新 | Esc:退出"
@@ -195,6 +201,12 @@ else
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
+    MSG[ASK_INSTALL_YAY]="No AUR helper detected. Install yay now? [Y/n] "
+    MSG[INSTALLING_YAY]=">> Installing yay, sudo required, please follow the prompts..."
+    MSG[YAY_INSTALL_OK]=">> yay installed successfully, continuing."
+    MSG[YAY_INSTALL_FAIL]="Error: yay installation failed. Please install it manually and retry."
+    MSG[ERR_NO_GIT]="Error: git not found, required to install yay. Run: sudo pacman -S git"
+    MSG[ERR_NO_BASE_DEVEL]="Error: base-devel group missing, required to build yay. Run: sudo pacman -S base-devel"
     MSG[INSTALLED]="[Installed]"
     MSG[INSTALLING]=">> Installing:"
     MSG[HEADER]="Tab:Multi-Select | Enter:Install | Ctrl+R:Force Refresh | Esc:Exit"
@@ -268,14 +280,45 @@ fi
 command -v fzf >/dev/null 2>&1 || { echo "${MSG[ERR_FZF]}" >&2; exit 1; }
 
 # 动态绑定 AUR 助手 (paru 优先，yay 兜底)
+install_yay() {
+    if ! command -v git >/dev/null 2>&1; then
+        echo -e "\033[31m${MSG[ERR_NO_GIT]}\033[0m" >&2
+        exit 1
+    fi
+    if ! pacman -Qg base-devel >/dev/null 2>&1; then
+        echo -e "\033[31m${MSG[ERR_NO_BASE_DEVEL]}\033[0m" >&2
+        exit 1
+    fi
+    echo -e "\033[33m${MSG[INSTALLING_YAY]}\033[0m"
+    local yay_build_dir
+    yay_build_dir=$(mktemp -d -t pac-yay-build.XXXXXX)
+    if ! git clone --depth=1 https://aur.archlinux.org/yay.git "$yay_build_dir" >&2; then
+        echo -e "\033[31m${MSG[YAY_INSTALL_FAIL]}\033[0m" >&2
+        rm -rf "$yay_build_dir"
+        exit 1
+    fi
+    if ! (cd "$yay_build_dir" && makepkg -si); then
+        echo -e "\033[31m${MSG[YAY_INSTALL_FAIL]}\033[0m" >&2
+        rm -rf "$yay_build_dir"
+        exit 1
+    fi
+    rm -rf "$yay_build_dir"
+    AUR_HELPER="yay"
+    echo -e "\033[32m${MSG[YAY_INSTALL_OK]}\033[0m"
+}
+
 AUR_HELPER=""
 if command -v paru >/dev/null 2>&1; then
     AUR_HELPER="paru"
 elif command -v yay >/dev/null 2>&1; then
     AUR_HELPER="yay"
 else
-    echo "${MSG[ERR_HELPER]}" >&2
-    exit 1
+    echo -e "\033[33m${MSG[ASK_INSTALL_YAY]}\033[0m" >&2
+    read -r answer || answer="n"
+    case "${answer:-Y}" in
+        y|Y|yes|YES) install_yay ;;
+        *) echo -e "\033[31m${MSG[ERR_HELPER]}\033[0m" >&2; exit 1 ;;
+    esac
 fi
 
 # --- 6. 异步逻辑与文件安全设置 (XDG 规范缓存) ---

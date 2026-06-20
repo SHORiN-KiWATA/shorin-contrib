@@ -40,20 +40,55 @@ jobs:
         run: |
           find /build/shorin-contrib-git -name "*.pkg.tar.zst" -exec mv {} /release/ \;
           cd /release
-          
+
           if ! ls *.pkg.tar.zst >/dev/null 2>&1; then
             echo "Error: Package compilation failed." >&2
             exit 1
           fi
 
+          # Sign each package
           for PKG in *.pkg.tar.zst; do
             gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --detach-sign --no-armor "$PKG"
           done
 
+          # Fetch existing databases from R2 (ignore errors on first run)
           aws s3 cp s3://shorin-arch-repo/archlinux/x86_64/shorin-arch.db.tar.gz ./shorin-arch.db.tar.gz \
-            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com || true
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com || echo "New DB"
+          aws s3 cp s3://shorin-arch-repo/archlinux/x86_64/shorin-arch.files.tar.gz ./shorin-arch.files.tar.gz \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com || echo "New files DB"
 
+          # repo-add updates both .db.tar.gz and .files.tar.gz, and signs them (--sign)
           repo-add --sign --key 8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8 shorin-arch.db.tar.gz *.pkg.tar.zst
+
+          # Create non-.tar.gz copies and sign them too
+          cp shorin-arch.db.tar.gz shorin-arch.db
+          cp shorin-arch.files.tar.gz shorin-arch.files
+          gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --detach-sign --no-armor shorin-arch.db
+          gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --detach-sign --no-armor shorin-arch.files
+
+      - name: Clean up old packages on R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          # List all .pkg.tar.zst on R2, delete old versions not present locally
+          cd /release
+          LOCAL_PKGS=$(ls *.pkg.tar.zst 2>/dev/null | sort)
+
+          R2_PREFIX="s3://shorin-arch-repo/archlinux/x86_64/"
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+
+          for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep '\.pkg\.tar\.zst$'); do
+            # Skip if this package exists locally (current version)
+            if echo "$LOCAL_PKGS" | grep -qxF "$R2_OBJ"; then
+              continue
+            fi
+            echo "Removing old package: $R2_OBJ"
+            aws s3 rm "${R2_PREFIX}${R2_OBJ}" ${ENDPOINT}
+            # Also remove its signature if present
+            aws s3 rm "${R2_PREFIX}${R2_OBJ}.sig" ${ENDPOINT} 2>/dev/null || true
+          done
 
       - name: Sync to Cloudflare R2
         env:
