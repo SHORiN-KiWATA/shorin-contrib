@@ -16,11 +16,12 @@ jobs:
         run: |
           pacman -Syu --noconfirm
           pacman -S --noconfirm aws-cli sudo git
-          mkdir -p /build /release
-          chown -R nobody:nobody /build /release
+          useradd -m builder
           mkdir -p /etc/sudoers.d
-          echo "nobody ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/nobody
-          chmod 440 /etc/sudoers.d/nobody
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          chmod 440 /etc/sudoers.d/builder
+          mkdir -p /build /release
+          chown -R builder:builder /build /release
 
       - name: Configure GPG
         run: |
@@ -31,9 +32,9 @@ jobs:
       - name: Fetch and Compile AUR Package
         run: |
           cd /build
-          sudo -u nobody git clone "https://aur.archlinux.org/shorin-contrib-git.git"
+          sudo -u builder git clone "https://aur.archlinux.org/shorin-contrib-git.git"
           cd shorin-contrib-git
-          sudo -u nobody bash -c "makepkg -s --noconfirm"
+          sudo -u builder bash -c "makepkg -s --noconfirm"
 
       - name: Sign and Update Database
         run: |
