@@ -1,4 +1,4 @@
-name: Build and Deploy shorin-contrib
+name: Build and Deploy shorin-contrib-git
 
 on:
   push:
@@ -28,13 +28,13 @@ jobs:
       - name: Fetch and Compile AUR Package
         run: |
           cd /build
-          sudo -u nobody git clone "https://aur.archlinux.org/shorin-contrib.git"
-          cd shorin-contrib
+          sudo -u nobody git clone "https://aur.archlinux.org/shorin-contrib-git.git"
+          cd shorin-contrib-git
           sudo -u nobody bash -c "makepkg -s --noconfirm"
 
       - name: Sign and Update Database
         run: |
-          find /build/shorin-contrib -name "*.pkg.tar.zst" -exec mv {} /release/ \;
+          find /build/shorin-contrib-git -name "*.pkg.tar.zst" -exec mv {} /release/ \;
           cd /release
           
           if ! ls *.pkg.tar.zst >/dev/null 2>&1; then
