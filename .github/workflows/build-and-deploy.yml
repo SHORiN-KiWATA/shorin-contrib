@@ -75,22 +75,32 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
-          # List all .pkg.tar.zst on R2, delete old versions not present locally
+          # Only remove old versions of packages built in THIS run.
+          # Extract package base name (everything before the first -<version>)
+          # from local packages, then delete R2 packages with the same base
+          # name but different filename.
           cd /release
-          LOCAL_PKGS=$(ls *.pkg.tar.zst 2>/dev/null | sort)
 
           R2_PREFIX="s3://shorin-arch-repo/archlinux/x86_64/"
           ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
 
-          for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep '\.pkg\.tar\.zst$'); do
-            # Skip if this package exists locally (current version)
-            if echo "$LOCAL_PKGS" | grep -qxF "$R2_OBJ"; then
-              continue
-            fi
-            echo "Removing old package: $R2_OBJ"
-            aws s3 rm "${R2_PREFIX}${R2_OBJ}" ${ENDPOINT}
-            # Also remove its signature if present
-            aws s3 rm "${R2_PREFIX}${R2_OBJ}.sig" ${ENDPOINT} 2>/dev/null || true
+          for LOCAL_PKG in *.pkg.tar.zst; do
+            # Extract base name: strip -<version>-<rel>-<arch>.pkg.tar.zst
+            BASE_NAME=$(echo "$LOCAL_PKG" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+
+            echo "Looking for old versions of: $BASE_NAME"
+            for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep "\.pkg\.tar\.zst$"); do
+              # Skip if it is the current package
+              [ "$R2_OBJ" = "$LOCAL_PKG" ] && continue
+
+              # Check if this R2 package has the same base name
+              R2_BASE=$(echo "$R2_OBJ" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+              [ "$R2_BASE" = "$BASE_NAME" ] || continue
+
+              echo "Removing old version: $R2_OBJ"
+              aws s3 rm "${R2_PREFIX}${R2_OBJ}" ${ENDPOINT}
+              aws s3 rm "${R2_PREFIX}${R2_OBJ}.sig" ${ENDPOINT} 2>/dev/null || true
+            done
           done
 
           # Remove any stale .old backup files left by previous repo-add runs
