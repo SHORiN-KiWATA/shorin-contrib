@@ -1,0 +1,233 @@
+#!/bin/bash
+# 描述： 终端闹钟与倒计时
+# Description: Terminal alarm & countdown timer
+# =============================================================================
+# timer v1.0
+# =============================================================================
+# 用法 / Usage:
+#   timer 10m          # 10 分钟后响铃
+#   timer 14:30        # 14:30 响铃
+#   timer 1h 30m       # 组合时长
+#   timer 30s          # 30 秒
+# 时间到后循环播放提示音，按回车停止。
+# Press Enter to stop the alarm when it rings.
+
+set -euo pipefail
+
+# ------------------------------
+# 1. Localization
+# ------------------------------
+if [[ "${LC_MESSAGES:-${LANG:-}}" == *zh_CN* ]]; then
+  UI_LANG="zh"
+else
+  UI_LANG="en"
+fi
+
+declare -A MSG
+if [[ "$UI_LANG" == "zh" ]]; then
+  MSG[ALARM_SET]="⏰ 闹钟已设定：%s 后响铃 (目标时刻 %s)"
+  MSG[COUNTDOWN]="⏳ 剩余 %s"
+  MSG[RINGING]="🔔 时间到！按回车停止闹钟..."
+  MSG[STOPPED]="✅ 闹钟已关闭。"
+  MSG[ERR_TIME]="错误：无法识别的时间格式 '%s'"
+  MSG[ERR_PAST]="错误：目标时间 %s 已过去"
+  MSG[ERR_NO_SOUND]="错误：未找到 pw-play，且终端蜂鸣器也不可用"
+  MSG[USAGE]="用法：timer <时间>\n  timer 10m       10 分钟后响铃\n  timer 14:30     14:30 响铃\n  timer 1h 30m    组合时长\n  timer 30s       30 秒"
+  MSG[FALLBACK_BEEP]="⚠ 未找到 pw-play，回退到终端蜂鸣器"
+else
+  MSG[ALARM_SET]="⏰ Alarm set: ringing in %s (target %s)"
+  MSG[COUNTDOWN]="⏳ %s remaining"
+  MSG[RINGING]="🔔 Time's up! Press Enter to stop the alarm..."
+  MSG[STOPPED]="✅ Alarm stopped."
+  MSG[ERR_TIME]="Error: unrecognized time format '%s'"
+  MSG[ERR_PAST]="Error: target time %s has already passed"
+  MSG[ERR_NO_SOUND]="Error: pw-play not found and terminal bell unavailable"
+  MSG[USAGE]="Usage: timer <time>\n  timer 10m       ring in 10 minutes\n  timer 14:30     ring at 14:30\n  timer 1h 30m    combined duration\n  timer 30s       30 seconds"
+  MSG[FALLBACK_BEEP]="⚠ pw-play not found, falling back to terminal bell"
+fi
+
+# ------------------------------
+# 2. Colors
+# ------------------------------
+NC='\033[0m'
+H_CYAN='\033[1;36m'
+H_YELLOW='\033[1;33m'
+H_GREEN='\033[1;32m'
+H_RED='\033[1;31m'
+
+# ------------------------------
+# 3. Sound file
+# ------------------------------
+SOUND_FILE="/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+[[ ! -f "$SOUND_FILE" ]] && SOUND_FILE="/usr/share/sounds/freedesktop/stereo/complete.oga"
+
+# ------------------------------
+# 4. Parse time argument -> total seconds
+# ------------------------------
+# Returns 0 on success, sets SECONDS_LEFT and TARGET_TIME
+parse_time() {
+  local input=("$@")
+  local total=0
+  local matched=0
+
+  # Try HH:MM format (single arg containing colon)
+  if [[ ${#input[@]} -eq 1 && "$1" == *:* ]]; then
+    local hh mm
+    if [[ "$1" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+      hh="${BASH_REMATCH[1]}"
+      mm="${BASH_REMATCH[2]}"
+      local now_epoch target_epoch today_epoch
+      now_epoch=$(date +%s)
+      today_epoch=$(date -d "$(date +%Y-%m-%d)" +%s)
+      target_epoch=$(( today_epoch + hh * 3600 + mm * 60 ))
+
+      # If already passed, schedule for tomorrow
+      if [[ $target_epoch -le $now_epoch ]]; then
+        target_epoch=$(( target_epoch + 86400 ))
+      fi
+
+      SECONDS_LEFT=$(( target_epoch - now_epoch ))
+      TARGET_TIME=$(date -d "@$target_epoch" +%H:%M)
+      return 0
+    else
+      printf "${H_RED}${MSG[ERR_TIME]}${NC}\n" "$1"
+      exit 1
+    fi
+  fi
+
+  # Try duration segments: 1h 30m 15s
+  for seg in "${input[@]}"; do
+    if [[ "$seg" =~ ^([0-9]+)([hmsHMS])$ ]]; then
+      local num="${BASH_REMATCH[1]}"
+      local unit="${BASH_REMATCH[2],,}"
+      case "$unit" in
+        h) total=$(( total + num * 3600 )) ;;
+        m) total=$(( total + num * 60 )) ;;
+        s) total=$(( total + num )) ;;
+      esac
+      matched=1
+    else
+      printf "${H_RED}${MSG[ERR_TIME]}${NC}\n" "$seg"
+      exit 1
+    fi
+  done
+
+  if [[ $matched -eq 0 ]]; then
+    printf "${H_RED}${MSG[ERR_TIME]}${NC}\n" "$*"
+    exit 1
+  fi
+
+  SECONDS_LEFT=$total
+  TARGET_TIME=$(date -d "+$total seconds" +%H:%M)
+}
+
+# ------------------------------
+# 5. Format seconds -> human readable
+# ------------------------------
+format_duration() {
+  local s=$1
+  local h=$(( s / 3600 ))
+  local m=$(( (s % 3600) / 60 ))
+  local sec=$(( s % 60 ))
+  if [[ $h -gt 0 ]]; then
+    printf "%dh %dm %ds" "$h" "$m" "$sec"
+  elif [[ $m -gt 0 ]]; then
+    printf "%dm %ds" "$m" "$sec"
+  else
+    printf "%ds" "$sec"
+  fi
+}
+
+# ------------------------------
+# 6. Countdown
+# ------------------------------
+countdown() {
+  local remaining=$SECONDS_LEFT
+  while [[ $remaining -gt 0 ]]; do
+    local dur
+    dur=$(format_duration "$remaining")
+    printf "\r${H_CYAN}${MSG[COUNTDOWN]}${NC}   " "$dur"
+    sleep 1
+    remaining=$(( remaining - 1 ))
+  done
+  printf "\r\033[K"
+}
+
+# ------------------------------
+# 7. Ring alarm (loop until Enter)
+# ------------------------------
+ring_alarm() {
+  bg_pid=""
+
+  # Cleanup function
+  cleanup() {
+    # Kill the background loop and ALL its children (pw-play etc.) immediately
+    if [[ -n "${bg_pid:-}" ]]; then
+      kill -KILL "$bg_pid" 2>/dev/null || true
+      pkill -KILL -P "$bg_pid" 2>/dev/null || true
+      wait "$bg_pid" 2>/dev/null || true
+    fi
+    # Ensure no stray pw-play lingers
+    pkill -KILL -x pw-play 2>/dev/null || true
+    printf "\n${H_GREEN}${MSG[STOPPED]}${NC}\n"
+    exit 0
+  }
+  trap cleanup INT TERM
+
+  if command -v pw-play >/dev/null 2>&1 && [[ -f "$SOUND_FILE" ]]; then
+    # Loop pw-play in background
+    (
+      while true; do
+        pw-play "$SOUND_FILE" 2>/dev/null || true
+        sleep 0.3
+      done
+    ) &
+    bg_pid=$!
+  else
+    # Fallback: terminal bell loop
+    printf "${H_YELLOW}${MSG[FALLBACK_BEEP]}${NC}\n"
+    (
+      while true; do
+        printf '\a'
+        sleep 1
+      done
+    ) &
+    bg_pid=$!
+  fi
+
+  # Desktop notification (best-effort)
+  if command -v notify-send >/dev/null 2>&1; then
+    if [[ "$UI_LANG" == "zh" ]]; then
+      notify-send -u critical "timer" "⏰ 时间到！" 2>/dev/null || true
+    else
+      notify-send -u critical "timer" "⏰ Time's up!" 2>/dev/null || true
+    fi
+  fi
+
+  printf "${H_YELLOW}${MSG[RINGING]}${NC}\n"
+  # Wait for Enter, then cleanup
+  read -r
+  cleanup
+}
+
+# ------------------------------
+# 8. Main
+# ------------------------------
+if [[ $# -lt 1 ]]; then
+  printf "${H_RED}${MSG[USAGE]}${NC}\n"
+  exit 1
+fi
+
+case "$1" in
+  -h|--help)
+    printf "${MSG[USAGE]}\n"
+    exit 0
+    ;;
+esac
+
+parse_time "$@"
+dur=$(format_duration "$SECONDS_LEFT")
+printf "${H_GREEN}${MSG[ALARM_SET]}${NC}\n" "$dur" "$TARGET_TIME"
+
+countdown
+ring_alarm
