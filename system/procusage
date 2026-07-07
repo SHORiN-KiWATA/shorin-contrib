@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# description: Rank all processes, or list CPU/memory usage for one app.
 # 显示名称：查询进程占用
 # 描述：查询进程的CPU和内存占用，还能列出最高资源占用排名。
-# description: Rank all processes, or list CPU/memory usage for one app.
+
 
 set -euo pipefail
 
@@ -9,7 +10,7 @@ readonly SCRIPT_NAME="procusage"
 readonly CMD_MAX_LEN=120
 
 usage() {
-  if is_zh_locale; then
+    if is_zh_locale; then
     cat <<'EOF'
 procusage - 查看进程 CPU 和内存占用
 
@@ -17,7 +18,7 @@ procusage - 查看进程 CPU 和内存占用
   procusage <软件名>              列出该软件的进程占用
   procusage -h|--help            显示帮助
 EOF
-  else
+    else
     cat <<'EOF'
 procusage - view process CPU and memory usage
 
@@ -25,216 +26,216 @@ procusage - view process CPU and memory usage
   procusage <app>                list process usage for an app
   procusage -h|--help            show help
 EOF
-  fi
+    fi
 }
 
 err() { printf 'error: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 
 is_zh_locale() {
-  local locale_value="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
-  [[ "${locale_value,,}" == zh* ]]
+    local locale_value="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+    [[ "${locale_value,,}" == zh* ]]
 }
 
 is_positive_int() {
-  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
 }
 
 json_string_value() {
-  local input="$1" key="$2" pattern
-  pattern="\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
-  [[ "$input" =~ $pattern ]] && printf '%s' "${BASH_REMATCH[1]}"
-}
-
-json_number_value() {
-  local input="$1" key="$2" pattern
-  pattern="\"$key\"[[:space:]]*:[[:space:]]*([0-9]+)"
-  [[ "$input" =~ $pattern ]] && printf '%s' "${BASH_REMATCH[1]}"
-}
-
-json_first_arg() {
-  local input="$1" pattern
-  pattern='"args"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)"'
-  [[ "$input" =~ $pattern ]] && printf '%s' "${BASH_REMATCH[1]}"
-}
-
-argv_from_stdin() {
-  local input="$1" mode app sort n value
-  input="$(trim "$input")"
-  [[ -n "$input" ]] || return 1
-
-  if [[ "$input" != *'{'* && "$input" != *'['* && "$input" != *':'* ]]; then
-    printf '%s\n' $input
-    return 0
-  fi
-
-  mode="$(json_string_value "$input" mode)"
-  [[ -z "$mode" ]] && mode="$(json_string_value "$input" command)"
-  sort="$(json_string_value "$input" sort)"
-  n="$(json_number_value "$input" n)"
-  [[ -z "$n" ]] && n="$(json_number_value "$input" count)"
-  [[ -z "$n" ]] && n="$(json_number_value "$input" limit)"
-
-  for key in app app_name appName application name software program process process_name processName query target; do
-    value="$(json_string_value "$input" "$key")"
-    [[ -n "$value" ]] && { app="$value"; break; }
-  done
-
-  value="$(json_first_arg "$input")"
-  if [[ -n "$value" ]]; then
-    printf '%s\n' "$value"
-    return 0
-  fi
-
-  if [[ "$mode" == "rank" ]]; then
-    printf '%s\n' rank
-    [[ -n "$sort" ]] && printf '%s\n' "$sort"
-    [[ -n "$n" ]] && printf '%s\n' "$n"
-    return 0
-  fi
-
-  [[ -n "${app:-}" ]] && { printf '%s\n' "$app"; return 0; }
-  return 1
-}
-
-trim() {
-  local value="${1:-}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "$value"
-}
-
-strip_quotes() {
-  local value="${1:-}"
-  if [[ "$value" == '"'*'"' && ${#value} -ge 2 ]]; then
-    value="${value:1:${#value}-2}"
-  elif [[ "$value" == "'"*"'" && ${#value} -ge 2 ]]; then
-    value="${value:1:${#value}-2}"
-  fi
-  printf '%s' "$value"
-}
-
-same_token() {
-  [[ "${1,,}" == "${2,,}" ]]
-}
-
-contains_token() {
-  [[ "${1,,}" == *"${2,,}"* ]]
-}
-
-desktop_dirs() {
-  printf '%s\n' \
-    "$HOME/.local/share/applications" \
-    "$HOME/.local/share/flatpak/exports/share/applications" \
-    "/usr/local/share/applications" \
-    "/usr/share/applications" \
-    "/var/lib/flatpak/exports/share/applications"
-}
-
-desktop_id() {
-  local path="${1##*/}"
-  printf '%s' "${path%.desktop}"
-}
-
-first_exec_word() {
-  local exec_line="${1:-}" token
-  exec_line="${exec_line//%[fFuUdDnNickvm]/}"
-  exec_line="$(trim "$exec_line")"
-  [[ -n "$exec_line" ]] || return 1
-
-  if [[ "$exec_line" == '"'* ]]; then
-    token="${exec_line#\"}"
+    local input="$1" key="$2" pattern
+    pattern="\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
+        [[ "$input" =~ $pattern ]] && printf '%s' "${BASH_REMATCH[1]}"
+    }
+    
+    json_number_value() {
+        local input="$1" key="$2" pattern
+        pattern="\"$key\"[[:space:]]*:[[:space:]]*([0-9]+)"
+        [[ "$input" =~ $pattern ]] && printf '%s' "${BASH_REMATCH[1]}"
+    }
+    
+    json_first_arg() {
+        local input="$1" pattern
+        pattern='"args"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)"'
+        [[ "$input" =~ $pattern ]] && printf '%s' "${BASH_REMATCH[1]}"
+    }
+    
+    argv_from_stdin() {
+        local input="$1" mode app sort n value
+        input="$(trim "$input")"
+        [[ -n "$input" ]] || return 1
+        
+        if [[ "$input" != *'{'* && "$input" != *'['* && "$input" != *':'* ]]; then
+            printf '%s\n' $input
+            return 0
+        fi
+        
+        mode="$(json_string_value "$input" mode)"
+        [[ -z "$mode" ]] && mode="$(json_string_value "$input" command)"
+        sort="$(json_string_value "$input" sort)"
+        n="$(json_number_value "$input" n)"
+        [[ -z "$n" ]] && n="$(json_number_value "$input" count)"
+        [[ -z "$n" ]] && n="$(json_number_value "$input" limit)"
+        
+        for key in app app_name appName application name software program process process_name processName query target; do
+            value="$(json_string_value "$input" "$key")"
+            [[ -n "$value" ]] && { app="$value"; break; }
+        done
+        
+        value="$(json_first_arg "$input")"
+        if [[ -n "$value" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+        
+        if [[ "$mode" == "rank" ]]; then
+            printf '%s\n' rank
+            [[ -n "$sort" ]] && printf '%s\n' "$sort"
+            [[ -n "$n" ]] && printf '%s\n' "$n"
+            return 0
+        fi
+        
+        [[ -n "${app:-}" ]] && { printf '%s\n' "$app"; return 0; }
+        return 1
+    }
+    
+    trim() {
+        local value="${1:-}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        printf '%s' "$value"
+    }
+    
+    strip_quotes() {
+        local value="${1:-}"
+        if [[ "$value" == '"'*'"' && ${#value} -ge 2 ]]; then
+            value="${value:1:${#value}-2}"
+            elif [[ "$value" == "'"*"'" && ${#value} -ge 2 ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        printf '%s' "$value"
+    }
+    
+    same_token() {
+        [[ "${1,,}" == "${2,,}" ]]
+    }
+    
+    contains_token() {
+        [[ "${1,,}" == *"${2,,}"* ]]
+    }
+    
+    desktop_dirs() {
+        printf '%s\n' \
+        "$HOME/.local/share/applications" \
+        "$HOME/.local/share/flatpak/exports/share/applications" \
+        "/usr/local/share/applications" \
+        "/usr/share/applications" \
+        "/var/lib/flatpak/exports/share/applications"
+    }
+    
+    desktop_id() {
+        local path="${1##*/}"
+        printf '%s' "${path%.desktop}"
+    }
+    
+    first_exec_word() {
+        local exec_line="${1:-}" token
+        exec_line="${exec_line//%[fFuUdDnNickvm]/}"
+        exec_line="$(trim "$exec_line")"
+        [[ -n "$exec_line" ]] || return 1
+        
+        if [[ "$exec_line" == '"'* ]]; then
+        token="${exec_line#\"}"
     token="${token%%\"*}"
-  elif [[ "$exec_line" == "'"* ]]; then
+    elif [[ "$exec_line" == "'"* ]]; then
     token="${exec_line#\'}"
     token="${token%%\'*}"
-  else
+else
     token="${exec_line%%[[:space:]]*}"
-  fi
+fi
 
-  token="$(strip_quotes "$token")"
-  [[ -n "$token" ]] || return 1
-  printf '%s' "$token"
+token="$(strip_quotes "$token")"
+[[ -n "$token" ]] || return 1
+printf '%s' "$token"
 }
 
 resolve_exec_path() {
-  local exec_word="$1" resolved
+local exec_word="$1" resolved
 
-  if [[ "$exec_word" == */* ]]; then
+if [[ "$exec_word" == */* ]]; then
     readlink -f "$exec_word" 2>/dev/null || printf '%s' "$exec_word"
     return 0
-  fi
+fi
 
-  if resolved="$(command -v -- "$exec_word" 2>/dev/null)"; then
+if resolved="$(command -v -- "$exec_word" 2>/dev/null)"; then
     readlink -f "$resolved" 2>/dev/null || printf '%s' "$resolved"
     return 0
-  fi
+fi
 
-  printf '%s' "$exec_word"
+printf '%s' "$exec_word"
 }
 
 resolve_wrapper_exec_path() {
-  local path="$1" depth="${2:-0}"
-  local line token resolved nested base dir sibling
+local path="$1" depth="${2:-0}"
+local line token resolved nested base dir sibling
 
-  (( depth < 5 )) || return 1
-  [[ -r "$path" && -f "$path" ]] || return 1
-  IFS= read -r line < "$path" || return 1
-  [[ "$line" == '#!'* ]] || return 1
+(( depth < 5 )) || return 1
+[[ -r "$path" && -f "$path" ]] || return 1
+IFS= read -r line < "$path" || return 1
+[[ "$line" == '#!'* ]] || return 1
 
-  while IFS= read -r line; do
+while IFS= read -r line; do
     line="$(trim "$line")"
     [[ "$line" == exec[[:space:]]/* ]] || continue
-
+    
     token="${line#exec }"
     token="${token%%[[:space:]]*}"
     token="$(strip_quotes "$token")"
     [[ -n "$token" ]] || continue
-
+    
     resolved="$(resolve_exec_path "$token")"
     nested="$(resolve_wrapper_exec_path "$resolved" "$((depth + 1))" 2>/dev/null || true)"
     printf '%s' "${nested:-$resolved}"
     return 0
-  done < "$path"
+done < "$path"
 
-  base="${path##*/}"
-  dir="${path%/*}"
-  sibling="$dir/../$base"
-  if [[ "$dir" == */bin && -x "$sibling" ]]; then
+base="${path##*/}"
+dir="${path%/*}"
+sibling="$dir/../$base"
+if [[ "$dir" == */bin && -x "$sibling" ]]; then
     readlink -f "$sibling" 2>/dev/null || printf '%s' "$sibling"
     return 0
-  fi
+fi
 
-  return 1
+return 1
 }
 
 parse_desktop() {
-  local file="$1"
-  local line key value name="" name_l10n="" exec_line="" tryexec="" wmclass=""
+local file="$1"
+local line key value name="" name_l10n="" exec_line="" tryexec="" wmclass=""
 
-  [[ -r "$file" ]] || return 1
-  while IFS= read -r line; do
+[[ -r "$file" ]] || return 1
+while IFS= read -r line; do
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      Name) [[ -z "$name" ]] && name="$value" ;;
-      Name\[*\]) [[ -z "$name_l10n" ]] && name_l10n="$value" ;;
-      Exec) [[ -z "$exec_line" ]] && exec_line="$value" ;;
-      TryExec) [[ -z "$tryexec" ]] && tryexec="$value" ;;
-      StartupWMClass) [[ -z "$wmclass" ]] && wmclass="$value" ;;
+        Name) [[ -z "$name" ]] && name="$value" ;;
+        Name\[*\]) [[ -z "$name_l10n" ]] && name_l10n="$value" ;;
+        Exec) [[ -z "$exec_line" ]] && exec_line="$value" ;;
+        TryExec) [[ -z "$tryexec" ]] && tryexec="$value" ;;
+        StartupWMClass) [[ -z "$wmclass" ]] && wmclass="$value" ;;
     esac
-  done < "$file"
+done < "$file"
 
-  [[ -n "$exec_line" ]] || return 1
-  printf '%s\t%s\t%s\t%s\t%s\n' "$exec_line" "$tryexec" "$name" "$name_l10n" "$wmclass"
+[[ -n "$exec_line" ]] || return 1
+printf '%s\t%s\t%s\t%s\t%s\n' "$exec_line" "$tryexec" "$name" "$name_l10n" "$wmclass"
 }
 
 desktop_score() {
-  local file="$1" query="$2" parsed="$3"
-  local id exec_line tryexec name name_l10n wmclass exec_word exec_base score=0
+local file="$1" query="$2" parsed="$3"
+local id exec_line tryexec name name_l10n wmclass exec_word exec_base score=0
 
-  id="$(desktop_id "$file")"
+id="$(desktop_id "$file")"
   IFS=$'\t' read -r exec_line tryexec name name_l10n wmclass <<< "$parsed"
   exec_word="$(first_exec_word "$exec_line" 2>/dev/null || true)"
   exec_base="${exec_word##*/}"
