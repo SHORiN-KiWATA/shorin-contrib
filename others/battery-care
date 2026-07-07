@@ -1,0 +1,934 @@
+#!/usr/bin/env bash
+# 描述：查询电池信息，修改充电阈值等笔记本电池相关功能
+# Description: Query battery information, modify charging threshold, and other laptop battery-related functions 
+
+set -u
+
+VERSION="0.2.0"
+APP_NAME="battery-care"
+SYSFS_ROOT="${SYSFS_ROOT:-}"
+DRY_RUN=0
+
+declare -a BACKEND LABEL MODE START_PATH STOP_PATH VALUE_PATH CHARGE_TYPE_PATH CHARGE_TYPES_PATH
+
+usage() {
+  cat <<'EOF'
+battery-care - laptop battery health and charge limit tool
+
+Usage:
+  battery-care
+  battery-care status
+  sudo battery-care limit 80
+  sudo battery-care set --stop 80
+  sudo battery-care reset
+
+Commands:
+  status    show health, charge, limit, backend, and path
+  limit N   set stop limit; numeric backends use start=N-5
+  set       set --start N and/or --stop N
+  reset     restore full charge
+  doctor    detailed diagnostics
+
+Options:
+  --dry-run         show writes without changing sysfs
+  --sysfs-root DIR  prefix sysfs paths for fixture testing
+EOF
+}
+
+err() { printf 'error: %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+sys_path() {
+  printf '%s%s' "$SYSFS_ROOT" "$1"
+}
+
+read_first() {
+  local path="$1"
+  [[ -r "$path" ]] || return 1
+  IFS= read -r line < "$path" || true
+  printf '%s' "$line"
+}
+
+read_prop() {
+  local dir="$1"
+  local name="$2"
+  local path="$dir/$name"
+  [[ -r "$path" ]] || return 1
+  read_first "$path"
+}
+
+format_sysfs_number() {
+  local value="$1"
+  local scale="${2:-}"
+  [[ -n "$value" ]] || return 1
+  [[ "$value" =~ ^[0-9]+$ ]] || {
+    printf '%s' "$value"
+    return 0
+  }
+  case "$scale" in
+    micro_wh)
+      awk -v v="$value" 'BEGIN { printf "%.1f Wh", v / 1000000 }'
+      ;;
+    micro_ah)
+      awk -v v="$value" 'BEGIN { printf "%.1f Ah", v / 1000000 }'
+      ;;
+    micro_w)
+      awk -v v="$value" 'BEGIN { printf "%.1f W", v / 1000000 }'
+      ;;
+    micro_a)
+      awk -v v="$value" 'BEGIN { printf "%.1f A", v / 1000000 }'
+      ;;
+    micro_v)
+      awk -v v="$value" 'BEGIN { printf "%.2f V", v / 1000000 }'
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+format_charge_as_energy() {
+  local charge_uah="$1"
+  local voltage_uv="$2"
+  [[ -n "$charge_uah" ]] || return 1
+  if [[ "$charge_uah" =~ ^[0-9]+$ && "$voltage_uv" =~ ^[0-9]+$ && "$voltage_uv" -gt 0 ]]; then
+    awk -v c="$charge_uah" -v v="$voltage_uv" 'BEGIN { printf "%.1f Wh", c * v / 1000000000000 }'
+  else
+    format_sysfs_number "$charge_uah" micro_ah
+  fi
+}
+
+percent_from_energy() {
+  local full="$1"
+  local design="$2"
+  [[ "$full" =~ ^[0-9]+$ && "$design" =~ ^[0-9]+$ && "$design" -gt 0 ]] || return 1
+  awk -v full="$full" -v design="$design" 'BEGIN { printf "%.1f%%", full * 100 / design }'
+}
+
+first_battery_dir() {
+  local psdir ps type
+  psdir="$(sys_path /sys/class/power_supply)"
+  [[ -d "$psdir" ]] || return 1
+  shopt -s nullglob
+  for ps in "$psdir"/*; do
+    [[ -e "$ps/type" ]] || continue
+    type="$(read_first "$ps/type")" || continue
+    if [[ "$type" == "Battery" ]]; then
+      printf '%s' "$ps"
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+one_line() {
+  local value="$1"
+  value="${value//$'\n'/ }"
+  value="${value//$'\t'/ }"
+  while [[ "$value" == *'  '* ]]; do
+    value="${value//  / }"
+  done
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+is_int_0_100() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 && value <= 100 ))
+}
+
+contains_word() {
+  local list="$1"
+  local needle="$2"
+  local word
+  for word in $list; do
+    [[ "$word" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+add_backend() {
+  BACKEND+=("$1")
+  LABEL+=("$2")
+  MODE+=("$3")
+  START_PATH+=("$4")
+  STOP_PATH+=("$5")
+  VALUE_PATH+=("$6")
+  CHARGE_TYPE_PATH+=("$7")
+  CHARGE_TYPES_PATH+=("$8")
+}
+
+probe_standard_power_supply() {
+  local psdir ps type name start stop ctype ctypes supported
+  psdir="$(sys_path /sys/class/power_supply)"
+  [[ -d "$psdir" ]] || return 0
+
+  shopt -s nullglob
+  for ps in "$psdir"/*; do
+    [[ -e "$ps/type" ]] || continue
+    type="$(read_first "$ps/type")" || continue
+    [[ "$type" == "Battery" ]] || continue
+
+    name="${ps##*/}"
+    start="$ps/charge_control_start_threshold"
+    stop="$ps/charge_control_end_threshold"
+    ctype="$ps/charge_type"
+    ctypes="$ps/charge_types"
+
+    if [[ -e "$start" || -e "$stop" ]]; then
+      add_backend "standard-threshold" "$name" "numeric-threshold" "$start" "$stop" "" "$ctype" "$ctypes"
+      continue
+    fi
+
+    if [[ -r "$ctype" && -r "$ctypes" ]]; then
+      supported="$(read_first "$ctypes")"
+      if contains_word "$supported" "Long_Life"; then
+        add_backend "standard-charge-type" "$name" "fixed-long-life" "" "" "" "$ctype" "$ctypes"
+      fi
+    fi
+  done
+  shopt -u nullglob
+}
+
+probe_thinkpad_smapi() {
+  local bat name start stop
+  shopt -s nullglob
+  for bat in "$(sys_path /sys/devices/platform/smapi)"/BAT*; do
+    [[ -d "$bat" ]] || continue
+    start="$bat/start_charge_thresh"
+    stop="$bat/stop_charge_thresh"
+    [[ -e "$start" || -e "$stop" ]] || continue
+    name="${bat##*/}"
+    add_backend "thinkpad-smapi" "$name" "numeric-threshold" "$start" "$stop" "" "" ""
+  done
+  shopt -u nullglob
+}
+
+probe_huawei_wmi() {
+  local path
+  path="$(sys_path /sys/devices/platform/huawei-wmi/charge_control_thresholds)"
+  [[ -e "$path" ]] || return 0
+  add_backend "huawei-wmi" "huawei-wmi" "numeric-pair" "" "" "$path" "" ""
+}
+
+probe_ideapad_conservation() {
+  local path
+  shopt -s nullglob
+  for path in "$(sys_path /sys/bus/platform/devices)"/VPC2004:*/conservation_mode \
+              "$(sys_path /sys/bus/platform/drivers/ideapad_acpi)"/*/conservation_mode; do
+    [[ -e "$path" ]] || continue
+    add_backend "ideapad-conservation" "ideapad-conservation" "fixed-toggle" "" "" "$path" "" ""
+  done
+  shopt -u nullglob
+}
+
+probe_vendor_toggles() {
+  local path
+
+  path="$(sys_path /sys/devices/platform/lg-laptop/battery_care_limit)"
+  [[ -e "$path" ]] && add_backend "lg-legacy" "lg-laptop" "fixed-limit" "" "" "$path" "" ""
+
+  path="$(sys_path /sys/devices/platform/samsung/battery_life_extender)"
+  [[ -e "$path" ]] && add_backend "samsung-legacy" "samsung" "fixed-toggle" "" "" "$path" "" ""
+
+  path="$(sys_path /sys/devices/platform/sony-laptop/battery_care_limiter)"
+  [[ -e "$path" ]] && add_backend "sony-legacy" "sony-laptop" "fixed-toggle" "" "" "$path" "" ""
+}
+
+probe_all() {
+  BACKEND=()
+  LABEL=()
+  MODE=()
+  START_PATH=()
+  STOP_PATH=()
+  VALUE_PATH=()
+  CHARGE_TYPE_PATH=()
+  CHARGE_TYPES_PATH=()
+
+  probe_standard_power_supply
+  probe_thinkpad_smapi
+  probe_huawei_wmi
+  probe_ideapad_conservation
+  probe_vendor_toggles
+}
+
+count_backend() {
+  local want="$1"
+  local i count=0
+  for i in "${!BACKEND[@]}"; do
+    [[ "${BACKEND[$i]}" == "$want" ]] && ((count++))
+  done
+  printf '%s' "$count"
+}
+
+selected_backend_type() {
+  local type
+  for type in standard-threshold thinkpad-smapi huawei-wmi standard-charge-type ideapad-conservation lg-legacy samsung-legacy sony-legacy; do
+    if (( $(count_backend "$type") > 0 )); then
+      printf '%s' "$type"
+      return 0
+    fi
+  done
+  return 1
+}
+
+selected_indexes() {
+  local type="$1"
+  local i
+  for i in "${!BACKEND[@]}"; do
+    [[ "${BACKEND[$i]}" == "$type" ]] && printf '%s\n' "$i"
+  done
+}
+
+path_writable_state() {
+  local path="$1"
+  if [[ -z "$path" || ! -e "$path" ]]; then
+    printf 'n/a'
+  elif [[ -w "$path" ]]; then
+    printf 'yes'
+  elif [[ -z "$SYSFS_ROOT" && "$path" == /sys/* && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    printf 'root-required'
+  else
+    printf 'no'
+  fi
+}
+
+device_name() {
+  local vendor=""
+  local product=""
+  [[ -r "$(sys_path /sys/class/dmi/id/sys_vendor)" ]] && vendor="$(read_first "$(sys_path /sys/class/dmi/id/sys_vendor)")"
+  [[ -r "$(sys_path /sys/class/dmi/id/product_name)" ]] && product="$(read_first "$(sys_path /sys/class/dmi/id/product_name)")"
+  if [[ -n "$vendor" && -n "$product" ]]; then
+    printf '%s / %s' "$vendor" "$product"
+  elif [[ -n "$vendor" ]]; then
+    printf '%s' "$vendor"
+  elif [[ -n "$product" ]]; then
+    printf '%s' "$product"
+  else
+    printf 'unknown'
+  fi
+}
+
+control_summary() {
+  local idx="$1"
+  case "${MODE[$idx]}" in
+    numeric-threshold)
+      if [[ -e "${START_PATH[$idx]}" && -e "${STOP_PATH[$idx]}" ]]; then
+        printf 'start-stop'
+      elif [[ -e "${STOP_PATH[$idx]}" ]]; then
+        printf 'stop-only'
+      elif [[ -e "${START_PATH[$idx]}" ]]; then
+        printf 'start-only'
+      else
+        printf 'numeric'
+      fi
+      ;;
+    numeric-pair)
+      printf 'start-stop'
+      ;;
+    fixed-toggle)
+      printf 'fixed-toggle'
+      ;;
+    fixed-limit)
+      printf 'fixed-limit'
+      ;;
+    fixed-long-life)
+      printf 'long-life-mode'
+      ;;
+    *)
+      printf '%s' "${MODE[$idx]}"
+      ;;
+  esac
+}
+
+write_summary() {
+  local idx="$1"
+  local path=""
+  [[ -n "${STOP_PATH[$idx]}" && -e "${STOP_PATH[$idx]}" ]] && path="${STOP_PATH[$idx]}"
+  [[ -z "$path" && -n "${START_PATH[$idx]}" && -e "${START_PATH[$idx]}" ]] && path="${START_PATH[$idx]}"
+  [[ -z "$path" && -n "${VALUE_PATH[$idx]}" && -e "${VALUE_PATH[$idx]}" ]] && path="${VALUE_PATH[$idx]}"
+  [[ -z "$path" && -n "${CHARGE_TYPE_PATH[$idx]}" && -e "${CHARGE_TYPE_PATH[$idx]}" ]] && path="${CHARGE_TYPE_PATH[$idx]}"
+  path_writable_state "$path"
+}
+
+limit_summary() {
+  local idx="$1"
+  local start=""
+  local stop=""
+  local value=""
+  local ctype=""
+  [[ -n "${START_PATH[$idx]}" && -r "${START_PATH[$idx]}" ]] && start="$(read_first "${START_PATH[$idx]}" 2>/dev/null || true)"
+  [[ -n "${STOP_PATH[$idx]}" && -r "${STOP_PATH[$idx]}" ]] && stop="$(read_first "${STOP_PATH[$idx]}" 2>/dev/null || true)"
+  [[ -n "${VALUE_PATH[$idx]}" && -r "${VALUE_PATH[$idx]}" ]] && value="$(read_first "${VALUE_PATH[$idx]}" 2>/dev/null || true)"
+  [[ -n "${CHARGE_TYPE_PATH[$idx]}" && -r "${CHARGE_TYPE_PATH[$idx]}" ]] && ctype="$(read_first "${CHARGE_TYPE_PATH[$idx]}" 2>/dev/null || true)"
+
+  if [[ -n "$start" && -n "$stop" ]]; then
+    printf 'start %s%%, stop %s%%' "$start" "$stop"
+  elif [[ -n "$stop" ]]; then
+    printf 'stop %s%%' "$stop"
+  elif [[ -n "$start" ]]; then
+    printf 'start %s%%' "$start"
+  elif [[ "${BACKEND[$idx]}" == "huawei-wmi" && -n "$value" ]]; then
+    printf '%s%%' "$value"
+  elif [[ "${BACKEND[$idx]}" == "lg-legacy" && -n "$value" ]]; then
+    printf 'stop %s%%' "$value"
+  elif [[ "${BACKEND[$idx]}" == "standard-charge-type" && -n "$ctype" ]]; then
+    printf '%s' "$ctype"
+  elif [[ -n "$value" ]]; then
+    case "$value" in
+      0) printf 'off/full charge' ;;
+      1) printf 'on/fixed limit' ;;
+      *) printf '%s' "$value" ;;
+    esac
+  else
+    printf 'unknown'
+  fi
+}
+
+primary_path() {
+  local idx="$1"
+  if [[ -n "${STOP_PATH[$idx]}" && -e "${STOP_PATH[$idx]}" ]]; then
+    printf '%s' "${STOP_PATH[$idx]}"
+  elif [[ -n "${VALUE_PATH[$idx]}" && -e "${VALUE_PATH[$idx]}" ]]; then
+    printf '%s' "${VALUE_PATH[$idx]}"
+  elif [[ -n "${CHARGE_TYPE_PATH[$idx]}" && -e "${CHARGE_TYPE_PATH[$idx]}" ]]; then
+    printf '%s' "${CHARGE_TYPE_PATH[$idx]}"
+  elif [[ -n "${START_PATH[$idx]}" && -e "${START_PATH[$idx]}" ]]; then
+    printf '%s' "${START_PATH[$idx]}"
+  fi
+}
+
+next_hint() {
+  local idx="$1"
+  local write_state
+  write_state="$(write_summary "$idx")"
+  if [[ "$write_state" == "root-required" ]]; then
+    printf 'sudo battery-care limit 80'
+  elif [[ "$write_state" == "yes" ]]; then
+    printf 'battery-care limit 80'
+  else
+    printf 'check: battery-care doctor'
+  fi
+}
+
+safe_write_path() {
+  local path="$1"
+  case "$path" in
+    "$SYSFS_ROOT"/sys/class/power_supply/*/charge_control_start_threshold|\
+    "$SYSFS_ROOT"/sys/class/power_supply/*/charge_control_end_threshold|\
+    "$SYSFS_ROOT"/sys/class/power_supply/*/charge_type|\
+    "$SYSFS_ROOT"/sys/devices/platform/smapi/BAT*/start_charge_thresh|\
+    "$SYSFS_ROOT"/sys/devices/platform/smapi/BAT*/stop_charge_thresh|\
+    "$SYSFS_ROOT"/sys/devices/platform/huawei-wmi/charge_control_thresholds|\
+    "$SYSFS_ROOT"/sys/bus/platform/devices/VPC2004:*/conservation_mode|\
+    "$SYSFS_ROOT"/sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode|\
+    "$SYSFS_ROOT"/sys/devices/platform/lg-laptop/battery_care_limit|\
+    "$SYSFS_ROOT"/sys/devices/platform/samsung/battery_life_extender|\
+    "$SYSFS_ROOT"/sys/devices/platform/sony-laptop/battery_care_limiter)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+write_value() {
+  local path="$1"
+  local value="$2"
+  local expected="${3:-$2}"
+  local after
+
+  safe_write_path "$path" || die "refusing to write non-whitelisted path: $path"
+  [[ -e "$path" ]] || die "path does not exist: $path"
+
+  if (( DRY_RUN )); then
+    printf 'dry-run: write %q to %s\n' "$value" "$path"
+    return 0
+  fi
+
+  if [[ ! -w "$path" ]]; then
+    if [[ -z "$SYSFS_ROOT" && "$path" == /sys/* && "${EUID:-$(id -u)}" -ne 0 ]]; then
+      die "permission denied for $path; rerun with sudo"
+    fi
+    die "path is not writable: $path"
+  fi
+
+  if ! printf '%s\n' "$value" > "$path"; then
+    die "write failed: $path"
+  fi
+
+  if [[ -n "$expected" && -r "$path" ]]; then
+    after="$(one_line "$(<"$path")")"
+    if [[ "$after" != "$expected" ]]; then
+      die "write verification failed for $path: expected '$expected', read '$after'"
+    fi
+  fi
+}
+
+maybe_set_custom_charge_type() {
+  local idx="$1"
+  local ctype="${CHARGE_TYPE_PATH[$idx]}"
+  local ctypes="${CHARGE_TYPES_PATH[$idx]}"
+  local supported current
+  [[ -r "$ctype" && -r "$ctypes" ]] || return 0
+  supported="$(read_first "$ctypes")"
+  contains_word "$supported" "Custom" || return 0
+  current="$(read_first "$ctype")"
+  [[ "$current" == "Custom" ]] && return 0
+  write_value "$ctype" "Custom" "Custom"
+}
+
+set_numeric_backend() {
+  local idx="$1"
+  local start="${2:-}"
+  local stop="${3:-}"
+  local spath="${START_PATH[$idx]}"
+  local epath="${STOP_PATH[$idx]}"
+  local current_start current_stop
+
+  [[ -n "$start" && -e "$spath" ]] || [[ -z "$start" ]] || die "${LABEL[$idx]} does not support a start threshold"
+  [[ -n "$stop" && -e "$epath" ]] || [[ -z "$stop" ]] || die "${LABEL[$idx]} does not support a stop threshold"
+
+  maybe_set_custom_charge_type "$idx"
+
+  current_start=""
+  current_stop=""
+  [[ -r "$spath" ]] && current_start="$(read_first "$spath")"
+  [[ -r "$epath" ]] && current_stop="$(read_first "$epath")"
+
+  if [[ -n "$stop" && -n "$current_start" && "$current_start" =~ ^[0-9]+$ ]] && (( current_start >= stop )); then
+    [[ -n "$start" ]] || die "current start threshold ($current_start) is not lower than requested stop ($stop); pass --start too"
+  fi
+  if [[ -n "$start" && -n "$current_stop" && "$current_stop" =~ ^[0-9]+$ ]] && (( start >= current_stop )); then
+    [[ -n "$stop" ]] || die "requested start ($start) is not lower than current stop threshold ($current_stop); pass --stop too"
+  fi
+
+  if [[ -n "$start" && -n "$stop" && -n "$current_stop" && "$current_stop" =~ ^[0-9]+$ ]] && (( start >= current_stop )); then
+    write_value "$epath" "$stop" "$stop"
+    write_value "$spath" "$start" "$start"
+  else
+    [[ -n "$start" ]] && write_value "$spath" "$start" "$start"
+    [[ -n "$stop" ]] && write_value "$epath" "$stop" "$stop"
+  fi
+}
+
+set_huawei_wmi() {
+  local idx="$1"
+  local start="$2"
+  local stop="$3"
+  [[ -n "$start" && -n "$stop" ]] || die "huawei-wmi requires both --start and --stop"
+  write_value "${VALUE_PATH[$idx]}" "$start $stop" "$start $stop"
+}
+
+set_charge_type_backend() {
+  local idx="$1"
+  local stop="$2"
+  local ctype="${CHARGE_TYPE_PATH[$idx]}"
+  if (( stop >= 100 )); then
+    write_value "$ctype" "Standard" "Standard"
+  elif (( stop <= 80 )); then
+    write_value "$ctype" "Long_Life" "Long_Life"
+  else
+    die "${LABEL[$idx]} supports only fixed Long_Life mode; use <=80 or reset to 100"
+  fi
+}
+
+set_toggle_backend() {
+  local idx="$1"
+  local stop="$2"
+  local value_path="${VALUE_PATH[$idx]}"
+  if (( stop >= 100 )); then
+    write_value "$value_path" "0" "0"
+  else
+    write_value "$value_path" "1" "1"
+  fi
+}
+
+set_lg_backend() {
+  local idx="$1"
+  local stop="$2"
+  local value_path="${VALUE_PATH[$idx]}"
+  if (( stop >= 100 )); then
+    write_value "$value_path" "100" "100"
+  elif (( stop <= 80 )); then
+    write_value "$value_path" "80" "80"
+  else
+    die "lg-laptop legacy interface supports only 80 or 100"
+  fi
+}
+
+apply_thresholds() {
+  local start="$1"
+  local stop="$2"
+  local type idx
+
+  probe_all
+  type="$(selected_backend_type)" || die "no supported charge-threshold interface detected"
+
+  while IFS= read -r idx; do
+    case "${BACKEND[$idx]}" in
+      standard-threshold|thinkpad-smapi)
+        set_numeric_backend "$idx" "$start" "$stop"
+        ;;
+      huawei-wmi)
+        set_huawei_wmi "$idx" "$start" "$stop"
+        ;;
+      standard-charge-type)
+        [[ -n "$stop" ]] || die "${LABEL[$idx]} supports fixed charge type only; pass --stop"
+        set_charge_type_backend "$idx" "$stop"
+        ;;
+      ideapad-conservation|samsung-legacy|sony-legacy)
+        [[ -n "$stop" ]] || die "${LABEL[$idx]} supports fixed toggle only; pass --stop"
+        set_toggle_backend "$idx" "$stop"
+        ;;
+      lg-legacy)
+        [[ -n "$stop" ]] || die "lg-laptop supports fixed limit only; pass --stop"
+        set_lg_backend "$idx" "$stop"
+        ;;
+    esac
+  done < <(selected_indexes "$type")
+
+  printf 'Applied: %s\n' "$type"
+}
+
+parse_set() {
+  local start=""
+  local stop=""
+  while (($#)); do
+    case "$1" in
+      --start)
+        (($# >= 2)) || die "--start requires a value"
+        start="$2"
+        shift 2
+        ;;
+      --stop|--end)
+        (($# >= 2)) || die "--stop requires a value"
+        stop="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown set option: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$start" || -n "$stop" ]] || die "set requires --start and/or --stop"
+  [[ -z "$start" ]] || is_int_0_100 "$start" || die "--start must be an integer from 0 to 100"
+  [[ -z "$stop" ]] || is_int_0_100 "$stop" || die "--stop must be an integer from 0 to 100"
+  if [[ -n "$start" && -n "$stop" ]]; then
+    (( start < stop )) || die "--start must be lower than --stop"
+  fi
+
+  apply_thresholds "$start" "$stop"
+}
+
+cmd_limit() {
+  local stop="$1"
+  local start
+  is_int_0_100 "$stop" || die "limit must be an integer from 0 to 100"
+  if (( stop >= 100 )); then
+    apply_thresholds "0" "100"
+  else
+    (( stop >= 5 )) || die "limit must be at least 5 when using numeric start threshold"
+    start=$((stop - 5))
+    apply_thresholds "$start" "$stop"
+  fi
+}
+
+cmd_reset() {
+  apply_thresholds "0" "100"
+
+  local type idx ctype ctypes supported
+  probe_all
+  type="$(selected_backend_type)" || return 0
+  while IFS= read -r idx; do
+    ctype="${CHARGE_TYPE_PATH[$idx]}"
+    ctypes="${CHARGE_TYPES_PATH[$idx]}"
+    if [[ -r "$ctype" && -r "$ctypes" ]]; then
+      supported="$(read_first "$ctypes")"
+      if contains_word "$supported" "Standard"; then
+        write_value "$ctype" "Standard" "Standard"
+      fi
+    fi
+  done < <(selected_indexes "$type")
+}
+
+print_backend() {
+  local i="$1"
+  local value current supported
+
+  printf '[%s] %s\n' "$i" "${LABEL[$i]}"
+  printf '  backend: %s\n' "${BACKEND[$i]}"
+  printf '  mode: %s\n' "${MODE[$i]}"
+
+  if [[ -n "${START_PATH[$i]}" && -e "${START_PATH[$i]}" ]]; then
+    value="$(read_first "${START_PATH[$i]}" 2>/dev/null || printf '?')"
+    printf '  start: %s (%s, writable: %s)\n' "$value" "${START_PATH[$i]}" "$(path_writable_state "${START_PATH[$i]}")"
+  fi
+
+  if [[ -n "${STOP_PATH[$i]}" && -e "${STOP_PATH[$i]}" ]]; then
+    value="$(read_first "${STOP_PATH[$i]}" 2>/dev/null || printf '?')"
+    printf '  stop: %s (%s, writable: %s)\n' "$value" "${STOP_PATH[$i]}" "$(path_writable_state "${STOP_PATH[$i]}")"
+  fi
+
+  if [[ -n "${VALUE_PATH[$i]}" && -e "${VALUE_PATH[$i]}" ]]; then
+    value="$(read_first "${VALUE_PATH[$i]}" 2>/dev/null || printf '?')"
+    printf '  value: %s (%s, writable: %s)\n' "$value" "${VALUE_PATH[$i]}" "$(path_writable_state "${VALUE_PATH[$i]}")"
+  fi
+
+  if [[ -n "${CHARGE_TYPE_PATH[$i]}" && -r "${CHARGE_TYPE_PATH[$i]}" ]]; then
+    current="$(read_first "${CHARGE_TYPE_PATH[$i]}")"
+    printf '  charge_type: %s (%s, writable: %s)\n' "$current" "${CHARGE_TYPE_PATH[$i]}" "$(path_writable_state "${CHARGE_TYPE_PATH[$i]}")"
+  fi
+
+  if [[ -n "${CHARGE_TYPES_PATH[$i]}" && -r "${CHARGE_TYPES_PATH[$i]}" ]]; then
+    supported="$(read_first "${CHARGE_TYPES_PATH[$i]}")"
+    printf '  charge_types: %s\n' "$supported"
+  fi
+}
+
+print_status_summary() {
+  local idx="$1"
+  local bat_dir state charge health full design capacity_line full_unit design_unit voltage_now
+  printf 'Device: %s\n' "$(device_name)"
+  printf 'Battery: %s\n' "${LABEL[$idx]}"
+  bat_dir="$(first_battery_dir || true)"
+  if [[ -n "$bat_dir" ]]; then
+    state="$(read_prop "$bat_dir" status 2>/dev/null || true)"
+    charge="$(read_prop "$bat_dir" capacity 2>/dev/null || true)"
+    full="$(read_prop "$bat_dir" energy_full 2>/dev/null || true)"
+    design="$(read_prop "$bat_dir" energy_full_design 2>/dev/null || true)"
+    voltage_now="$(read_prop "$bat_dir" voltage_now 2>/dev/null || true)"
+    full_unit="micro_wh"
+    design_unit="micro_wh"
+    if [[ -z "$full" ]]; then
+      full="$(read_prop "$bat_dir" charge_full 2>/dev/null || true)"
+      full_unit="micro_ah"
+    fi
+    if [[ -z "$design" ]]; then
+      design="$(read_prop "$bat_dir" charge_full_design 2>/dev/null || true)"
+      design_unit="micro_ah"
+    fi
+    health="$(percent_from_energy "$full" "$design" 2>/dev/null || true)"
+    if [[ -n "$state" ]]; then
+      printf 'State: %s\n' "$state"
+    fi
+    if [[ -n "$charge" ]]; then
+      printf 'Charge: %s%%\n' "$charge"
+    fi
+    if [[ -n "$health" ]]; then
+      printf 'Health: %s\n' "$health"
+    fi
+    if [[ -n "$full" || -n "$design" ]]; then
+      capacity_line=""
+      if [[ -n "$full" ]]; then
+        if [[ "$full_unit" == "micro_ah" ]]; then
+          capacity_line="full $(format_charge_as_energy "$full" "$voltage_now")"
+        else
+          capacity_line="full $(format_sysfs_number "$full" "$full_unit")"
+        fi
+      fi
+      if [[ -n "$design" ]]; then
+        if [[ "$design_unit" == "micro_ah" ]]; then
+          [[ -n "$capacity_line" ]] && capacity_line="$capacity_line / design $(format_charge_as_energy "$design" "$voltage_now")"
+          [[ -z "$capacity_line" ]] && capacity_line="design $(format_charge_as_energy "$design" "$voltage_now")"
+        else
+          [[ -n "$capacity_line" ]] && capacity_line="$capacity_line / design $(format_sysfs_number "$design" "$design_unit")"
+          [[ -z "$capacity_line" ]] && capacity_line="design $(format_sysfs_number "$design" "$design_unit")"
+        fi
+      fi
+      printf 'Capacity: %s\n' "$capacity_line"
+    fi
+  fi
+  printf 'Support: yes\n'
+  printf 'Backend: %s\n' "${BACKEND[$idx]}"
+  printf 'Control: %s\n' "$(control_summary "$idx")"
+  printf 'Limit: %s\n' "$(limit_summary "$idx")"
+  printf 'Write: %s\n' "$(write_summary "$idx")"
+  printf 'Path: %s\n' "$(primary_path "$idx")"
+}
+
+cmd_status() {
+  local type idx
+  probe_all
+  type="$(selected_backend_type)" || {
+    printf 'Support: no\n'
+    printf 'Device: %s\n' "$(device_name)"
+    printf 'Reason: no known charge-threshold interface\n'
+    printf 'Hint: battery-care doctor\n'
+    return 1
+  }
+
+  idx="$(selected_indexes "$type" | head -n 1)"
+  print_status_summary "$idx"
+}
+
+cmd_doctor() {
+  local psdir ps type name selected idx prop value path exists mark voltage_now
+  printf 'Tool: %s %s\n' "$APP_NAME" "$VERSION"
+  printf 'Shell: bash %s\n' "${BASH_VERSION:-unknown}"
+  printf 'UID: %s\n' "${EUID:-$(id -u)}"
+  printf 'Kernel: '
+  uname -sr
+  printf 'SysfsRoot: %s\n' "${SYSFS_ROOT:-/}"
+  printf 'Device: %s\n' "$(device_name)"
+
+  psdir="$(sys_path /sys/class/power_supply)"
+  printf '\nPowerSupplies:\n'
+  if [[ -d "$psdir" ]]; then
+    shopt -s nullglob
+    for ps in "$psdir"/*; do
+      [[ -e "$ps/type" ]] || continue
+      type="$(read_first "$ps/type")" || type="?"
+      name="${ps##*/}"
+      printf '  %s: %s\n' "$name" "$type"
+    done
+    shopt -u nullglob
+  else
+    printf '  missing: %s\n' "$psdir"
+  fi
+
+  printf '\nBatteries:\n'
+  if [[ -d "$psdir" ]]; then
+    shopt -s nullglob
+    for ps in "$psdir"/*; do
+      [[ -e "$ps/type" ]] || continue
+      type="$(read_first "$ps/type")" || continue
+      [[ "$type" == "Battery" ]] || continue
+      name="${ps##*/}"
+      voltage_now="$(read_prop "$ps" voltage_now 2>/dev/null || true)"
+      printf '  %s:\n' "$name"
+      for prop in manufacturer model_name serial_number status capacity capacity_level health cycle_count energy_now energy_full energy_full_design charge_now charge_full charge_full_design voltage_now power_now current_now technology scope present; do
+        value="$(read_prop "$ps" "$prop" 2>/dev/null || true)"
+        [[ -n "$value" ]] || continue
+        case "$prop" in
+          energy_*) value="$(format_sysfs_number "$value" micro_wh)" ;;
+          charge_*) value="$(format_charge_as_energy "$value" "$voltage_now")" ;;
+          voltage_now) value="$(format_sysfs_number "$value" micro_v)" ;;
+          power_now) value="$(format_sysfs_number "$value" micro_w)" ;;
+          current_now) value="$(format_sysfs_number "$value" micro_a)" ;;
+          capacity) value="${value}%" ;;
+        esac
+        printf '    %s: %s\n' "$prop" "$value"
+      done
+      value="$(percent_from_energy "$(read_prop "$ps" energy_full 2>/dev/null || read_prop "$ps" charge_full 2>/dev/null || true)" "$(read_prop "$ps" energy_full_design 2>/dev/null || read_prop "$ps" charge_full_design 2>/dev/null || true)" 2>/dev/null || true)"
+      [[ -n "$value" ]] && printf '    computed_health: %s\n' "$value"
+    done
+    shopt -u nullglob
+  fi
+
+  probe_all
+  printf '\nThreshold:\n'
+  selected="$(selected_backend_type 2>/dev/null || true)"
+  if [[ -n "$selected" ]]; then
+    idx="$(selected_indexes "$selected" | head -n 1)"
+    printf '  support: yes\n'
+    printf '  backend: %s\n' "${BACKEND[$idx]}"
+    printf '  battery: %s\n' "${LABEL[$idx]}"
+    printf '  control: %s\n' "$(control_summary "$idx")"
+    printf '  limit: %s\n' "$(limit_summary "$idx")"
+    printf '  write: %s\n' "$(write_summary "$idx")"
+    printf '  path: %s\n' "$(primary_path "$idx")"
+    printf '  detected_count: %s\n' "${#BACKEND[@]}"
+  else
+    printf '  support: no\n'
+    printf '  reason: no known charge-threshold interface\n'
+  fi
+
+  printf '\nDetectedInterfaces:\n'
+  if ((${#BACKEND[@]} > 0)); then
+    for idx in "${!BACKEND[@]}"; do
+      printf '  %s:\n' "${LABEL[$idx]}"
+      printf '    backend: %s\n' "${BACKEND[$idx]}"
+      printf '    control: %s\n' "$(control_summary "$idx")"
+      printf '    limit: %s\n' "$(limit_summary "$idx")"
+      printf '    write: %s\n' "$(write_summary "$idx")"
+      printf '    path: %s\n' "$(primary_path "$idx")"
+    done
+  else
+    printf '  none\n'
+  fi
+
+  printf '\nKnownPaths:\n'
+  shopt -s nullglob
+  for path in \
+    "$(sys_path /sys/class/power_supply)"/*/charge_control_start_threshold \
+    "$(sys_path /sys/class/power_supply)"/*/charge_control_end_threshold \
+    "$(sys_path /sys/class/power_supply)"/*/charge_type \
+    "$(sys_path /sys/class/power_supply)"/*/charge_types \
+    "$(sys_path /sys/devices/platform/smapi)"/BAT*/start_charge_thresh \
+    "$(sys_path /sys/devices/platform/smapi)"/BAT*/stop_charge_thresh \
+    "$(sys_path /sys/devices/platform/huawei-wmi/charge_control_thresholds)" \
+    "$(sys_path /sys/bus/platform/devices)"/VPC2004:*/conservation_mode \
+    "$(sys_path /sys/bus/platform/drivers/ideapad_acpi)"/*/conservation_mode \
+    "$(sys_path /sys/devices/platform/lg-laptop/battery_care_limit)" \
+    "$(sys_path /sys/devices/platform/samsung/battery_life_extender)" \
+    "$(sys_path /sys/devices/platform/sony-laptop/battery_care_limiter)"; do
+    [[ -e "$path" ]] || continue
+    mark="ro"
+    [[ -w "$path" ]] && mark="rw"
+    printf '  %s %s\n' "$mark" "$path"
+  done
+  shopt -u nullglob
+}
+
+parse_global_options() {
+  while (($#)); do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --sysfs-root)
+        (($# >= 2)) || die "--sysfs-root requires a directory"
+        SYSFS_ROOT="${2%/}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  REMAINING_ARGS=("$@")
+}
+
+declare -a REMAINING_ARGS
+parse_global_options "$@"
+set -- "${REMAINING_ARGS[@]}"
+
+cmd="${1:-status}"
+[[ $# -gt 0 ]] && shift || true
+
+case "$cmd" in
+  status)
+    cmd_status
+    ;;
+  set)
+    parse_set "$@"
+    ;;
+  limit)
+    (($# == 1)) || die "limit requires exactly one value"
+    cmd_limit "$1"
+    ;;
+  reset)
+    (($# == 0)) || die "reset takes no arguments"
+    cmd_reset
+    ;;
+  doctor)
+    cmd_doctor
+    ;;
+  help)
+    usage
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $cmd"
+    ;;
+esac
