@@ -14,8 +14,7 @@ if [[ "${1:-}" == "--generate-list" ]]; then
     FORCE_REFRESH="$2"
     INSTALLED_LIST="$3"
     AUR_CACHE="$4"
-    AUR_FILTER="$5"
-    MSG_INSTALLED="$6"
+    MSG_INSTALLED="$5"
     CACHE_TIME=3600
 
     AWK_CMD='
@@ -62,8 +61,7 @@ if [[ "${1:-}" == "--generate-list" ]]; then
 
     # 只要缓存文件大于 0，就显示它
     if [[ -s "$AUR_CACHE" ]]; then
-        grep -vE "$AUR_FILTER" "$AUR_CACHE" 2>/dev/null | \
-        awk '{print "aur", $1, "-"}' | \
+        awk '{print "aur", $1, "-"}' "$AUR_CACHE" | \
         awk -v c='\033[35m' -v ci='\033[32m' -v r='\033[0m' \
             -v label="$MSG_INSTALLED" \
             "$AWK_CMD" "$INSTALLED_LIST" -
@@ -331,7 +329,6 @@ mkfifo "$PIPE_FIFO"
 mkdir -p "$CACHE_DIR"
 
 AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
-AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
 
 # 【终极修复预览颜色】
 # 这段 AWK 代码负责准确识别“属性键”（例如 名字 : ），扒掉可能破坏颜色的隐藏 ANSI 码，再给它染上加粗青色。
@@ -511,7 +508,7 @@ trap abort INT TERM
 
 # --- 7. 数据生成器 (后台运行) ---
 # 利用内部自调用作为守护进程生成初始列表
-"$SCRIPT_PATH" --generate-list "$FORCE_REFRESH" "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "${MSG[INSTALLED]}" > "$PIPE_FIFO" 2>/dev/null &
+"$SCRIPT_PATH" --generate-list "$FORCE_REFRESH" "$INSTALLED_LIST" "$AUR_CACHE" "${MSG[INSTALLED]}" > "$PIPE_FIFO" 2>/dev/null &
 PID_GEN=$!
 
 # --- 8. 交互式 FZF 渲染 ---
@@ -524,7 +521,7 @@ else
 fi
 
 # 构造安全的 reload 命令
-RELOAD_CMD=$(printf "%q " "$SCRIPT_PATH" --generate-list true "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "${MSG[INSTALLED]}")
+RELOAD_CMD=$(printf "%q " "$SCRIPT_PATH" --generate-list true "$INSTALLED_LIST" "$AUR_CACHE" "${MSG[INSTALLED]}")
 
 set +e
 fzf --multi --ansi \
