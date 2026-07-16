@@ -330,7 +330,14 @@ perform_update() {
   # ===============================================================
   # 【致命警告防线】：强制交互模式并捕获错误
   # ===============================================================
-  if ! $UPDATE_CMD -Su; then
+  local UPDATE_ARGS=(-Su)
+  if [[ "$UPDATE_CMD" == "paru" ]]; then
+    UPDATE_ARGS+=(--skipreview)
+  elif [[ "$UPDATE_CMD" == "yay" ]]; then
+    UPDATE_ARGS+=(--answeredit None)
+  fi
+
+  if ! "$UPDATE_CMD" "${UPDATE_ARGS[@]}"; then
     printf "\n${H_RED}======================================================================${NC}\n"
     printf "${H_RED}%s${NC}\n" "${MSG[WARN_PARTIAL_TITLE]}"
     printf "${H_YELLOW}• %s${NC}\n" "${MSG[WARN_PARTIAL_1]}"
