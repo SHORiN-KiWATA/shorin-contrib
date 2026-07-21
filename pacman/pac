@@ -32,8 +32,8 @@ if [[ "${1:-}" == "--generate-list" ]]; then
             # 先打印带有颜色的源，紧接着打印重置符 \033[0m
             printf "%s%s%s", c, $1, r
             
-            # 【修复】：将对齐宽度从 11 调大到 16，确保足以容纳 "archlinuxcn" 等较长源名并留出空格
-            for(i=length($1); i<16; i++) printf " "
+            # 【修复】：将对齐宽度从 11 调大到 22，确保足以容纳 "archlinuxcn" "cachyos-extra-v3/4" 等较长源名并留出空格
+            for(i=length($1); i<22; i++) printf " "
             
             # 【修复】：将包名的占位从 %-30s 增大到 %-35s，让排版更宽松
             printf "%-35s %-20s %s\n", $2, $3, status
