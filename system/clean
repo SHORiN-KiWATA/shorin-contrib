@@ -266,7 +266,7 @@ fi
 
 if [[ -n "$ALL_ORPHANS" ]]; then
   mapfile -t ORPHAN_ARR <<< "$ALL_ORPHANS"
-  $PKG_MNGR -Rns "${ORPHAN_ARR[@]}"
+  $PKG_MNGR -Rns --noconfirm "${ORPHAN_ARR[@]}"
   _success "${MSG[ORPHAN_CLEAN]}"
 else
   _success "${MSG[ORPHAN_NONE]}"
@@ -277,7 +277,8 @@ if [[ "$CLEAN_ALL" == true ]]; then
   _info "${MSG[STEP_CACHE_ALL]}"
   
   # 1. 使用 sudo 清理 pacman 官方仓库缓存 (彻底)
-  sudo pacman -Scc --noconfirm >/dev/null 2>&1 || true
+  # 注意: -Scc 的"删除全部"提示默认答案为 no，--noconfirm 会静默跳过(等于没清)，必须用 yes 强制确认
+  yes | sudo pacman -Scc >/dev/null 2>&1 || true
   
   # 2. 清理 AUR 助手缓存并暴力铲除本地 git 源码克隆
   if command -v yay >/dev/null 2>&1; then
