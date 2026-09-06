@@ -2,27 +2,44 @@
 # 描述： 清理系统
 # Description: Clean system
 
-# 【功能说明】
+# 【模式说明 / Modes】
+#   clean          日常模式：只删除可再生的缓存和用户已丢弃的内容
+#   clean dev      开发模式：日常模式 + 各开发工具的全局缓存 (仅使用工具官方清理命令)
+#   clean all      激进模式：开发模式 + 完全清空软件包缓存、AUR 克隆、应用/浏览器缓存、
+#                  桌面索引、剪贴板历史、已卸载 Flatpak 残留、全部 Btrfs 快照 (保留 before 节点)
+#   --dry-run      仅列出将删除的内容与预计释放空间，不执行任何删除
+#
+# 【日常模式功能 / Default mode】
 # 1. 移除孤儿软件包与无主 debug 符号包 (Orphans & orphaned debug packages)
-# 2. 清理软件包缓存 (默认保留安装包，all 模式下完全清空)
-# 3. 清理残留的下载目录 (download-*)
-# 4. 清理 Systemd 日志 (只保留最近 2 周)
-# 5. 清空用户回收站 (Trash) 和缩略图缓存 (Thumbnails)
-# 6. 移除未使用的 Flatpak 运行时
-# 7. 清理截图与录屏目录 (Screenshots, wf-recorder & shorin-screenrec)
-# 8. 清理旧 Btrfs 快照与 btrfs-assistant 的冗余备份子卷 (all 模式下利用 snapper 命令清空快照但保留 before 节点)
+# 2. 清理软件包缓存 (仅保留已安装版本；all 模式完全清空)
+# 3. 清理 AUR 构建残留 (删除未安装的克隆及已安装克隆中的 src/pkg/构建产物，保留 git 仓库)
+# 4. 清理 systemd 日志 (先轮转再按 2 周 / 300M 收缩)
+# 5. 清理崩溃转储 (systemd coredump)
+# 6. 清空回收站 (含外置磁盘 .Trash-UID) 与 30 天前的缩略图
+# 7. 移除未使用的 Flatpak 运行时
+# 8. 清理截图与录屏文件 (默认仅删除 7 天前的文件，--media-days 可调)
+# 9. 清理旧 Btrfs 快照 (number / timeline / empty-pre-post) 与 btrfs-assistant 冗余备份子卷
+#
+# 【安全原则 / Safety】
+# - 路径从 pacman-conf / paru.conf / yay -Pg / xdg-user-dir 读取，不写死
+# - 开发缓存只用工具自带的 prune 命令，从不进入项目目录
+# - 正在运行的应用其缓存目录跳过
+# - all 模式总是需要确认 (--yes 无效)
+# - 按实际删除的文件体积统计，结尾给出可用空间变化
+#   (Btrfs 上被快照引用的数据要等快照删除后才真正释放)
 
 set -euo pipefail
 
-# ===============================================================
-# Arch Linux System Cleanup Assistant (Best Version)
-# ===============================================================
-
 # ------------------------------
-# 1. Default parameters & KISS Language Detection
+# 1. Defaults & language
 # ------------------------------
+MODE="normal"        # normal | dev | all
 SKIP_CONFIRM=false
-CLEAN_ALL=false
+DRY_RUN=false
+MEDIA_DAYS=7
+JOURNAL_KEEP_TIME="2weeks"
+JOURNAL_KEEP_SIZE="300M"
+THUMB_DAYS=30
 
 if [[ "${LC_MESSAGES:-${LANG:-}}" == *zh_CN* ]]; then
   UI_LANG="zh"
@@ -35,12 +52,19 @@ fi
 # ------------------------------
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [options]
+Usage: $(basename "$0") [mode] [options]
+
+Modes:
+  (none)             Daily cleanup: regenerable caches, trash, old logs
+  dev, --dev         Daily + developer tool caches (npm, pnpm, pip, uv, cargo, go, docker ...)
+  all, --all         Aggressive: dev + full package/AUR caches, app & browser caches,
+                     desktop indexes, clipboard history, ALL btrfs snapshots (keeps 'before' nodes)
 
 Options:
+  --dry-run, -n      Only list what would be removed and the estimated space
+  --yes, -y          Skip confirmation (normal/dev modes; 'all' always asks)
+  --media-days N     Only delete screenshots/recordings older than N days (default 7, 0 = all)
   --ui-lang zh|en    Force UI language (default: auto)
-  all, --all         Enable aggressive cleanup (clear all cache & snapshots)
-  --yes, -y          Skip confirmation prompt (non-interactive)
   --help, -h         Show this help and exit
 EOF
 }
@@ -48,397 +72,807 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
   --ui-lang) [[ "${2:-}" =~ ^(zh|en)$ ]] && UI_LANG="$2" && shift 2 || { echo "Error: --ui-lang requires zh or en."; exit 1; } ;;
-  all | --all) CLEAN_ALL=true && shift ;;
-  --yes | -y) SKIP_CONFIRM=true && shift ;;
+  all | --all) MODE="all"; shift ;;
+  dev | --dev) [[ "$MODE" == "all" ]] || MODE="dev"; shift ;;
+  --dry-run | -n) DRY_RUN=true; shift ;;
+  --yes | -y) SKIP_CONFIRM=true; shift ;;
+  --media-days) [[ "${2:-}" =~ ^[0-9]+$ ]] && MEDIA_DAYS="$2" && shift 2 || { echo "Error: --media-days requires a number."; exit 1; } ;;
   --help | -h) usage; exit 0 ;;
   *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
 
+is_dev() { [[ "$MODE" == "dev" || "$MODE" == "all" ]]; }
+is_all() { [[ "$MODE" == "all" ]]; }
+
 # ------------------------------
-# 3. Localization Logic (Associative Arrays)
+# 3. Localization
 # ------------------------------
 declare -A MSG
 if [[ "$UI_LANG" == "zh" ]]; then
-  TAG_INFO="[消息]"
-  TAG_SUCCESS="[成功]"
-  TAG_WARN="[注意]"
-  TAG_ERROR="[错误]"
-
   MSG[INTRO_HEADER]="=== Arch Linux 系统清理助手 ==="
-  MSG[DESC_TITLE]="本脚本将执行以下清理操作："
+  MSG[MODE_NORMAL]="默认 (日常)"
+  MSG[MODE_DEV]="DEV (开发)"
+  MSG[MODE_ALL]="ALL (激进)"
+  MSG[MODE_LINE]="模式：%s"
+  MSG[PREVIEW_TAG]="[预览，不会删除任何内容]"
+  MSG[AVAIL]="可用空间：%s"
+  MSG[HELPER_USE]="包管理器：%s"
+  MSG[DESC_TITLE]="将执行以下清理："
   MSG[DESC_1]="1. 删除孤儿软件包与无主 debug 符号包"
   MSG[DESC_2]="2. 清理软件包缓存 (仅保留已安装版本)"
-  MSG[DESC_3]="3. 清理 systemd 日志 (保留最近2周)"
-  MSG[DESC_4]="4. 清空回收站、缩略图和剪贴板缓存"
-  MSG[DESC_5]="5. 删除未使用的 Flatpak 运行时"
-  MSG[DESC_6]="6. 清理截图和屏幕录制文件"
-  MSG[DESC_7]="7. 清理旧 Btrfs 快照与冗余备份子卷"
-  
-  MSG[DESC_ALL_1]="* [ALL模式] 完全清空所有软件包与 AUR 幽灵缓存"
-  MSG[DESC_ALL_2]="* [ALL模式] 删除所有 Btrfs 快照 (保留 Before 节点)"
-
+  MSG[DESC_3]="3. 清理 AUR 构建残留 (保留 git 仓库)"
+  MSG[DESC_4]="4. 清理 systemd 日志 (轮转后保留 %s 且不超过 %s)"
+  MSG[DESC_5]="5. 清理崩溃转储 (coredump)"
+  MSG[DESC_6]="6. 清空回收站 (含外置磁盘) 和 %s 天前的缩略图"
+  MSG[DESC_7]="7. 删除未使用的 Flatpak 运行时"
+  MSG[DESC_8]="8. 清理 %s 天前的截图和屏幕录制文件"
+  MSG[DESC_8_ALL]="8. 清理全部截图和屏幕录制文件"
+  MSG[DESC_9]="9. 清理旧 Btrfs 快照 (number / timeline / empty-pre-post)"
+  MSG[DESC_DEV]="+ [DEV] 清理开发工具缓存 (npm / pnpm / yarn / bun / pip / uv / cargo / go / gradle / conda / docker / debtap ...)"
+  MSG[DESC_ALL_1]="* [ALL] 完全清空软件包缓存与 AUR 克隆，删除仅被可选依赖引用的包"
+  MSG[DESC_ALL_2]="* [ALL] 清理应用/浏览器缓存、剪贴板历史、桌面索引、已卸载 Flatpak 残留、Docker 未引用镜像"
+  MSG[DESC_ALL_3]="* [ALL] 删除全部 Btrfs 快照与备份子卷 (仅保留描述以 Before 开头的快照)"
+  MSG[DESC_HINT]="提示：clean dev 追加开发工具缓存，clean all 为激进模式，--dry-run 仅预览"
   MSG[ASK_CONFIRM]="是否继续执行清理？[Y/n]"
-  MSG[ABORT]="用户已取消清理。"
-  MSG[DONE]="系统清理完成！"
-
+  MSG[ASK_CONFIRM_ALL]="确认执行 ALL 模式清理？[y/N]"
+  MSG[ABORT]="已取消。"
+  MSG[DONE]="系统清理完成！共删除 %s，可用空间 %s → %s"
+  MSG[DRY_DONE]="预览结束，未删除任何内容。预计可释放 %s。"
+    MSG[BTRFS_NOTE]="(Btrfs 上被快照引用的数据要等快照删除后才会真正释放)"
+  MSG[NONE]="无需清理。"
+  MSG[STEP_DONE]="已清理 %s。"
+  MSG[STEP_OK]="完成。"
+  MSG[STEP_PREVIEW]="预计可释放 %s。"
+  MSG[SUDO_FAIL]="sudo 认证失败。"
   MSG[NO_HELPER]="未找到受支持的包管理器 (需要 paru, yay 或 pacman)"
-  MSG[HELPER_USE]="使用包管理器：%s"
-  MSG[STEP_ORPHAN]="正在检查孤儿软件包..."
-  MSG[ORPHAN_FOUND]="发现孤儿软件包，准备清理..."
-  MSG[ORPHAN_DEBUG_FOUND]="发现无主包的 debug 符号包，准备清理..."
-  MSG[ORPHAN_CLEAN]="已删除孤儿软件包。"
-  MSG[ORPHAN_NONE]="未发现孤儿软件包。"
-  
-  MSG[STEP_CACHE]="正在清理软件包缓存..."
-  MSG[CACHE_DONE]="软件包缓存已清理。"
-  MSG[STEP_CACHE_ALL]="正在完全清空所有软件包缓存与 AUR 源码树..."
-  MSG[CACHE_ALL_DONE]="所有软件包及 AUR 缓存已彻底清空。"
 
-  MSG[STEP_BROKEN]="正在清理残留下载目录..."
-  MSG[BROKEN_DONE]="残留目录已清理。"
-  MSG[STEP_LOG]="正在清理 systemd 日志..."
-  MSG[LOG_DONE]="系统日志已清理。"
-  MSG[CLIP_DONE]="剪贴板缓存已清理。"
-  MSG[STEP_TRASH]="正在清理回收站和缩略图..."
-  MSG[TRASH_DONE]="回收站已清空。"
-  MSG[THUMB_DONE]="缩略图已清理。"
-  MSG[STEP_FLATPAK]="正在检查未使用的 Flatpak 运行时..."
-  MSG[FLATPAK_DONE]="未使用的 Flatpak 运行时已删除。"
-  MSG[STEP_MEDIA]="正在清理截图和屏幕录制文件..."
-  MSG[MEDIA_DONE]="截图和录屏文件已清理。"
-
-  MSG[STEP_SNAP]="正在清理超出配额的旧 Btrfs 快照..."
-  MSG[SNAP_DONE]="旧快照已按配额自动清理完成。"
-  MSG[STEP_CLEAR_SNAP]="正在利用 snapper 清空所有快照 (保留 Before 节点)..."
-  MSG[CLEAR_SNAP_DONE]="所有指定的 Btrfs 快照已彻底清理。"
-  MSG[STEP_BTRFS_BA]="正在检查 btrfs-assistant 冗余备份子卷..."
-  MSG[BTRFS_BA_DONE]="冗余备份子卷已删除。"
-  MSG[BTRFS_BA_NONE]="未发现冗余备份子卷。"
+  MSG[T_ORPHAN]="正在检查孤儿软件包..."
+  MSG[ORPHAN_LIST]="%s 个孤儿包：%s"
+  MSG[ORPHAN_OPT_LIST]="%s 个仅被可选依赖引用的包：%s"
+  MSG[ORPHAN_DEBUG_LIST]="无主 debug 包：%s"
+  MSG[T_CACHE]="正在清理软件包缓存 (%s)..."
+  MSG[CACHE_ITEM]="旧版本 / 已卸载的包"
+  MSG[CACHE_ALL_ITEM]="全部 %s 个文件 (下次操作前需 pacman -Sy)"
+  MSG[T_AUR]="正在清理 AUR 构建残留..."
+  MSG[T_AUR_ALL]="正在完全清空 AUR 克隆..."
+  MSG[AUR_UNINSTALLED]="未安装的克隆：%s"
+  MSG[AUR_BUILD]="%s 个克隆的构建产物 (src / pkg / *.pkg.tar)"
+  MSG[AUR_ALL_ITEM]="%s 个目录  %s"
+  MSG[T_LOG]="正在清理 systemd 日志..."
+  MSG[LOG_ITEM]="轮转并收缩到 %s / %s (当前 %s)"
+  MSG[LOG_RESULT]="%s → %s"
+  MSG[T_CORE]="正在清理崩溃转储..."
+  MSG[CORE_ITEM]="%s 个 coredump"
+  MSG[T_TRASH]="正在清理回收站和缩略图..."
+  MSG[TRASH_ITEM]="回收站 %s"
+  MSG[THUMB_ITEM]="%s 个超过 %s 天的缩略图"
+  MSG[THUMB_ALL_ITEM]="全部 %s 个缩略图"
+  MSG[T_FLATPAK]="正在检查 Flatpak..."
+  MSG[FLATPAK_ITEM]="未使用的运行时：%s"
+  MSG[FLATPAK_ORPHAN_ITEM]="%s 个已卸载应用的残留数据：%s"
+  MSG[FLATPAK_APPCACHE_ITEM]="应用缓存 (~/.var/app/*/cache)"
+  MSG[T_MEDIA]="正在清理超过 %s 天的截图和录屏..."
+  MSG[T_MEDIA_ALL]="正在清理全部截图和录屏..."
+  MSG[MEDIA_ITEM]="%s  %s 个文件"
+  MSG[T_SNAP]="正在清理旧 Btrfs 快照..."
+  MSG[SNAP_ITEM]="[%s] cleanup number / timeline / empty-pre-post"
+  MSG[T_SNAP_ALL]="正在删除全部 Btrfs 快照 (保留 Before 节点)..."
+  MSG[SNAP_ALL_ITEM]="[%s] %s 个：%s"
+  MSG[T_BTRFS_BA]="正在检查 btrfs-assistant 备份子卷..."
+  MSG[BTRFS_BA_KEEP]="保留最新：%s"
+  MSG[T_DEV]="正在清理开发工具缓存..."
+  MSG[DOCKER_ITEM]="%s 悬空镜像与构建缓存"
+  MSG[DOCKER_ALL_ITEM]="%s 未被容器引用的镜像 (不含卷)"
+  MSG[T_APPCACHE]="正在清理应用和浏览器缓存..."
+  MSG[APPCACHE_ITEM]="%s  (%s 个缓存目录)"
+  MSG[APPCACHE_RUNNING]="%s 正在运行，跳过"
+  MSG[T_MISC]="正在清理剪贴板历史和桌面索引..."
+  MSG[CLIP_ITEM]="剪贴板历史 (cliphist)"
+  MSG[INDEX_ITEM]="桌面索引 %s (将重新建立)"
 else
-  TAG_INFO="[INFO]"
-  TAG_SUCCESS="[OK]"
-  TAG_WARN="[WARN]"
-  TAG_ERROR="[ERROR]"
-
   MSG[INTRO_HEADER]="=== Arch Linux System Cleanup Assistant ==="
-  MSG[DESC_TITLE]="The script will perform the following tasks:"
+  MSG[MODE_NORMAL]="default (daily)"
+  MSG[MODE_DEV]="DEV"
+  MSG[MODE_ALL]="ALL (aggressive)"
+  MSG[MODE_LINE]="Mode: %s"
+  MSG[PREVIEW_TAG]="[preview, nothing will be deleted]"
+  MSG[AVAIL]="Available: %s"
+  MSG[HELPER_USE]="Package manager: %s"
+  MSG[DESC_TITLE]="The following will be cleaned:"
   MSG[DESC_1]="1. Remove orphaned packages & orphaned debug packages"
-  MSG[DESC_2]="2. Clean package cache (keep installed)"
-  MSG[DESC_3]="3. Vacuum systemd journal logs (keep 2 weeks)"
-  MSG[DESC_4]="4. Empty Trash, thumbnail and clipboard cache"
-  MSG[DESC_5]="5. Remove unused Flatpak runtimes"
-  MSG[DESC_6]="6. Clean screenshots and screen records"
-  MSG[DESC_7]="7. Clean old btrfs snapshots & backup subvols"
-
-  MSG[DESC_ALL_1]="* [ALL MODE] Completely clear ALL package and AUR ghost caches"
-  MSG[DESC_ALL_2]="* [ALL MODE] Delete all btrfs snapshots (keep 'Before' nodes)"
-
+  MSG[DESC_2]="2. Clean package cache (keep installed versions)"
+  MSG[DESC_3]="3. Clean AUR build leftovers (keep git repos)"
+  MSG[DESC_4]="4. Rotate & vacuum systemd journal (keep %s, max %s)"
+  MSG[DESC_5]="5. Remove crash dumps (coredump)"
+  MSG[DESC_6]="6. Empty Trash (incl. external drives) and thumbnails older than %s days"
+  MSG[DESC_7]="7. Remove unused Flatpak runtimes"
+  MSG[DESC_8]="8. Delete screenshots and screen records older than %s days"
+  MSG[DESC_8_ALL]="8. Delete all screenshots and screen records"
+  MSG[DESC_9]="9. Clean old btrfs snapshots (number / timeline / empty-pre-post)"
+  MSG[DESC_DEV]="+ [DEV] Clean developer tool caches (npm / pnpm / yarn / bun / pip / uv / cargo / go / gradle / conda / docker / debtap ...)"
+  MSG[DESC_ALL_1]="* [ALL] Clear ALL package cache & AUR clones, remove packages required only as optional deps"
+  MSG[DESC_ALL_2]="* [ALL] Clear app/browser caches, clipboard history, desktop indexes, uninstalled Flatpak leftovers, unused Docker images"
+  MSG[DESC_ALL_3]="* [ALL] Delete ALL btrfs snapshots & backup subvolumes (keeps snapshots described 'Before...')"
+  MSG[DESC_HINT]="Hint: 'clean dev' adds developer caches, 'clean all' is aggressive, --dry-run previews only"
   MSG[ASK_CONFIRM]="Continue with cleanup? [Y/n]"
-  MSG[ABORT]="Cleanup cancelled by user."
-  MSG[DONE]="System cleanup completed!"
-
+  MSG[ASK_CONFIRM_ALL]="Run ALL mode cleanup? [y/N]"
+  MSG[ABORT]="Cancelled."
+  MSG[DONE]="System cleanup completed! Removed %s, available space %s → %s"
+  MSG[DRY_DONE]="Preview finished, nothing was deleted. Estimated %s to free."
+    MSG[BTRFS_NOTE]="(on btrfs, data still referenced by snapshots is released only after those snapshots are deleted)"
+  MSG[NONE]="Nothing to clean."
+  MSG[STEP_DONE]="Cleaned %s."
+  MSG[STEP_OK]="Done."
+  MSG[STEP_PREVIEW]="Estimated %s."
+  MSG[SUDO_FAIL]="Sudo authentication failed."
   MSG[NO_HELPER]="No supported package manager found (paru, yay, or pacman required)."
-  MSG[HELPER_USE]="Using package manager: %s"
-  MSG[STEP_ORPHAN]="Checking for orphaned packages..."
-  MSG[ORPHAN_FOUND]="Orphaned packages detected, cleaning..."
-  MSG[ORPHAN_DEBUG_FOUND]="Orphaned debug packages (no main package) detected, cleaning..."
-  MSG[ORPHAN_CLEAN]="Orphaned packages removed."
-  MSG[ORPHAN_NONE]="No orphaned packages found."
-  
-  MSG[STEP_CACHE]="Cleaning package cache..."
-  MSG[CACHE_DONE]="Package cache cleaned."
-  MSG[STEP_CACHE_ALL]="Completely cleaning ALL package caches & AUR clones..."
-  MSG[CACHE_ALL_DONE]="All package and AUR caches cleared completely."
 
-  MSG[STEP_BROKEN]="Cleaning residual download directories..."
-  MSG[BROKEN_DONE]="Residual directories removed."
-  MSG[STEP_LOG]="Vacuuming systemd journal logs..."
-  MSG[LOG_DONE]="Systemd journal logs cleaned."
-  MSG[CLIP_DONE]="Clipboard cache cleaned."
-  MSG[STEP_TRASH]="Cleaning user Trash and thumbnails..."
-  MSG[TRASH_DONE]="Trash emptied."
-  MSG[THUMB_DONE]="Thumbnails cleaned."
-  MSG[STEP_FLATPAK]="Checking for unused Flatpak runtimes..."
-  MSG[FLATPAK_DONE]="Unused Flatpak runtimes removed."
-  MSG[STEP_MEDIA]="Cleaning screenshots and screen records..."
-  MSG[MEDIA_DONE]="Screenshots and screen records cleaned."
-
-  MSG[STEP_SNAP]="Cleaning old btrfs snapshots..."
-  MSG[SNAP_DONE]="Old snapshots cleaned."
-  MSG[STEP_CLEAR_SNAP]="Clearing all snapshots using snapper (keeping 'Before' nodes)..."
-  MSG[CLEAR_SNAP_DONE]="All specified btrfs snapshots cleared."
-  MSG[STEP_BTRFS_BA]="Checking btrfs-assistant backup subvolumes..."
-  MSG[BTRFS_BA_DONE]="Backup subvolumes cleaned."
-  MSG[BTRFS_BA_NONE]="No redundant backup subvolumes found."
+  MSG[T_ORPHAN]="Checking for orphaned packages..."
+  MSG[ORPHAN_LIST]="%s orphans: %s"
+  MSG[ORPHAN_OPT_LIST]="%s required only as optional deps: %s"
+  MSG[ORPHAN_DEBUG_LIST]="orphaned debug packages: %s"
+  MSG[T_CACHE]="Cleaning package cache (%s)..."
+  MSG[CACHE_ITEM]="old versions / uninstalled packages"
+  MSG[CACHE_ALL_ITEM]="all %s files (run pacman -Sy before next operation)"
+  MSG[T_AUR]="Cleaning AUR build leftovers..."
+  MSG[T_AUR_ALL]="Clearing ALL AUR clones..."
+  MSG[AUR_UNINSTALLED]="uninstalled clones: %s"
+  MSG[AUR_BUILD]="build artifacts of %s clones (src / pkg / *.pkg.tar)"
+  MSG[AUR_ALL_ITEM]="%s directories  %s"
+  MSG[T_LOG]="Vacuuming systemd journal..."
+  MSG[LOG_ITEM]="rotate and vacuum to %s / %s (currently %s)"
+  MSG[LOG_RESULT]="%s → %s"
+  MSG[T_CORE]="Removing crash dumps..."
+  MSG[CORE_ITEM]="%s coredumps"
+  MSG[T_TRASH]="Cleaning Trash and thumbnails..."
+  MSG[TRASH_ITEM]="trash %s"
+  MSG[THUMB_ITEM]="%s thumbnails older than %s days"
+  MSG[THUMB_ALL_ITEM]="all %s thumbnails"
+  MSG[T_FLATPAK]="Checking Flatpak..."
+  MSG[FLATPAK_ITEM]="unused runtimes: %s"
+  MSG[FLATPAK_ORPHAN_ITEM]="leftover data of %s uninstalled apps: %s"
+  MSG[FLATPAK_APPCACHE_ITEM]="app caches (~/.var/app/*/cache)"
+  MSG[T_MEDIA]="Cleaning screenshots and recordings older than %s days..."
+  MSG[T_MEDIA_ALL]="Cleaning all screenshots and recordings..."
+  MSG[MEDIA_ITEM]="%s  %s files"
+  MSG[T_SNAP]="Cleaning old btrfs snapshots..."
+  MSG[SNAP_ITEM]="[%s] cleanup number / timeline / empty-pre-post"
+  MSG[T_SNAP_ALL]="Deleting ALL btrfs snapshots (keeping Before nodes)..."
+  MSG[SNAP_ALL_ITEM]="[%s] %s snapshots: %s"
+  MSG[T_BTRFS_BA]="Checking btrfs-assistant backup subvolumes..."
+  MSG[BTRFS_BA_KEEP]="keeping newest: %s"
+  MSG[T_DEV]="Cleaning developer tool caches..."
+  MSG[DOCKER_ITEM]="%s dangling images & build cache"
+  MSG[DOCKER_ALL_ITEM]="%s images not used by any container (volumes untouched)"
+  MSG[T_APPCACHE]="Cleaning application and browser caches..."
+  MSG[APPCACHE_ITEM]="%s  (%s cache dirs)"
+  MSG[APPCACHE_RUNNING]="%s is running, skipped"
+  MSG[T_MISC]="Cleaning clipboard history and desktop indexes..."
+  MSG[CLIP_ITEM]="clipboard history (cliphist)"
+  MSG[INDEX_ITEM]="desktop index %s (will be rebuilt)"
 fi
 
 # ------------------------------
-# 4. Define Colors & Logging
+# 4. Colors, output & helpers
 # ------------------------------
-NC='\033[0m'
-H_BLUE='\033[1;34m'
-H_GREEN='\033[1;32m'
-H_YELLOW='\033[1;33m'
-H_RED='\033[1;31m'
-H_CYAN='\033[1;36m'
+NC='\033[0m'; DIM='\033[2m'
+H_BLUE='\033[1;34m'; H_GREEN='\033[1;32m'; H_YELLOW='\033[1;33m'; H_RED='\033[1;31m'; H_CYAN='\033[1;36m'; C_CYAN='\033[36m'
+if [[ "$UI_LANG" == "zh" ]]; then
+  TAG_INFO="[消息]"; TAG_SUCCESS="[成功]"; TAG_WARN="[注意]"; TAG_SKIP="[跳过]"; TAG_PREVIEW="[预览]"
+else
+  TAG_INFO="[INFO]"; TAG_SUCCESS="[OK]"; TAG_WARN="[WARN]"; TAG_SKIP="[SKIP]"; TAG_PREVIEW="[PREVIEW]"
+fi
 
-_info()    { local fmt=$1; shift; printf "${H_BLUE}%-10s${NC} ${fmt}\n" "${TAG_INFO}" "$@"; }
-_success() { local fmt=$1; shift; printf "${H_GREEN}%-10s${NC} ${fmt}\n" "${TAG_SUCCESS}" "$@"; }
-_warn()    { local fmt=$1; shift; printf "${H_YELLOW}%-10s${NC} ${fmt}\n" "${TAG_WARN}" "$@"; }
-_error()   { local fmt=$1; shift; printf "${H_RED}%-10s${NC} ${fmt}\n" "${TAG_ERROR}" "$@"; exit 1; }
+_error() { printf "${H_RED}%-10s${NC} %s\n" "[ERROR]" "$*" >&2; exit 1; }
+
+PREVIEW=false        # true in --dry-run: list only, delete nothing
+TOTAL_BYTES=0        # bytes of everything listed for deletion
+STEP_ITEMS=0; STEP_BYTES=0
+UID_NUM=$(id -u)
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+# 1536 -> "1.5 KiB"; -1 -> "-" (unknown)
+fmt_bytes() {
+  local b=${1:-0}
+  if [[ "$b" -lt 0 ]]; then echo "-"; return; fi
+  if [[ "$b" -lt 1024 ]]; then echo "${b} B"; return; fi
+  numfmt --to=iec-i --format='%.1f' "$b" 2>/dev/null | sed -E 's/([KMGTPE]i)$/ \1B/'
+}
+# disk usage in bytes of the given existing paths (0 if none)
+dir_bytes() {
+  local -a ex=(); local p
+  for p in "$@"; do [[ -e "$p" ]] && ex+=("$p"); done
+  [[ ${#ex[@]} -eq 0 ]] && { echo 0; return; }
+  du -sc --block-size=1 "${ex[@]}" 2>/dev/null | tail -1 | cut -f1
+}
+sudo_dir_bytes() {
+  [[ $# -eq 0 ]] && { echo 0; return; }
+  local s; s=$(sudo du -sc --block-size=1 "$@" 2>/dev/null | tail -1 | cut -f1); echo "${s:-0}"
+}
+# bytes of files matched by: find_bytes DIR [find-tests...]
+find_bytes() { find "$@" -printf '%b\0' 2>/dev/null | awk 'BEGIN{RS="\0"; s=0} {s+=$0*512} END{print s+0}'; }
+# free space: sum of unique filesystems backing / and $HOME
+avail_bytes() {
+  local total=0 seen=" " src t a
+  for t in / "$HOME"; do
+    src=$(findmnt -n -o SOURCE --target "$t" 2>/dev/null | head -1 | cut -d'[' -f1)
+    [[ -z "$src" ]] && continue
+    [[ "$seen" == *" $src "* ]] && continue
+    seen="$seen$src "
+    a=$(df -B1 --output=avail "$t" 2>/dev/null | tail -1 | tr -d ' ')
+    total=$(( total + ${a:-0} ))
+  done
+  echo "$total"
+}
+
+# Tags are padded by display width (CJK = 2 columns), so text always starts at column 11
+TAG_COL=10
+pad_tag() {
+  local t=$1 bytes wide
+  bytes=$(printf '%s' "$t" | wc -c); wide=$(( (bytes - ${#t}) / 2 ))      # UTF-8 CJK: 3 bytes, 2 columns
+  printf '%s%*s' "$t" $(( TAG_COL - ${#t} - wide > 0 ? TAG_COL - ${#t} - wide : 0 )) ''
+}
+printf -v INDENT '%*s' $(( TAG_COL + 1 )) ''
+_info()    { local fmt=$1; shift; printf "${H_BLUE}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_INFO")" "$@"; }
+_success() { local fmt=$1; shift; printf "${H_GREEN}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_SUCCESS")" "$@"; }
+_warn()    { local fmt=$1; shift; printf "${H_YELLOW}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_WARN")" "$@"; }
+_skip()    { local fmt=$1; shift; printf "${DIM}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_SKIP")" "$@"; }
+_preview() { local fmt=$1; shift; printf "${H_CYAN}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_PREVIEW")" "$@"; }
+
+# step TITLE_FMT [args]    -> "[消息] 正在..." line
+step() { _info "$@"; STEP_ITEMS=0; STEP_BYTES=0; }
+# item BYTES TEXT          -> one deletion entry under the step (BYTES=-1 when unknown)
+MIN_ITEM_BYTES=$(( 1024 * 1024 ))
+item() {
+  local bytes=$1; shift
+  # negligible entries are still cleaned, just not listed
+  if [[ "$bytes" -ge 0 && "$bytes" -lt $MIN_ITEM_BYTES ]]; then return 0; fi
+  if [[ "$bytes" -ge 0 ]]; then printf "%s${DIM}-${NC} %s ${C_CYAN}(%s)${NC}\n" "$INDENT" "$*" "$(fmt_bytes "$bytes")"
+  else printf "%s${DIM}-${NC} %s\n" "$INDENT" "$*"; fi
+  STEP_ITEMS=$(( STEP_ITEMS + 1 ))
+  if [[ "$bytes" -gt 0 ]]; then STEP_BYTES=$(( STEP_BYTES + bytes )); TOTAL_BYTES=$(( TOTAL_BYTES + bytes )); fi
+}
+note() { printf "%s  ${DIM}%s${NC}\n" "$INDENT" "$*"; }
+skip() { _skip "$@"; }
+# step_end -> "[成功] 已清理 X。" / "[成功] 完成。" / "[成功] 无需清理。"  ([预览] in dry-run)
+step_end() {
+  local say=_success; [[ "$PREVIEW" == true ]] && say=_preview
+  if [[ $STEP_ITEMS -eq 0 ]]; then $say "${MSG[NONE]}"
+  elif [[ $STEP_BYTES -gt 0 ]]; then
+    if [[ "$PREVIEW" == true ]]; then $say "${MSG[STEP_PREVIEW]}" "$(fmt_bytes "$STEP_BYTES")"; else $say "${MSG[STEP_DONE]}" "$(fmt_bytes "$STEP_BYTES")"; fi
+  else $say "${MSG[STEP_OK]}"; fi
+}
+
+run() { if [[ "$PREVIEW" == false ]]; then "$@"; fi; }
+rm_contents() { local d=$1; [[ -d "${d:?}" ]] && run find "$d" -mindepth 1 -xdev -delete 2>/dev/null || true; }
+join_words() { local IFS=' '; echo "$*"; }
+# a process counts as "this app" only when NAME is a whole path component / word of its cmdline
+app_running() {
+  local re; re=$(printf '%s' "$1" | sed 's/[][\\.*^$/+?(){}|]/\\&/g')
+  pgrep -fi -- "(^|/)${re}([ /]|\$)" 2>/dev/null | grep -v "^$$\$" | head -1 || true
+}
+journal_usage() { sudo journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+ ?[KMGT]?B?' | head -1 || true; }
+pkgs_installed_bytes() {  # sum of "Installed Size" for the given packages (-1 when unknown)
+  local s; s=$(LC_ALL=C pacman -Qi "$@" 2>/dev/null | awk -F': *' '/^Installed Size/ {print $2}' | sed 's/ //; s/iB$/i/; s/B$//' \
+    | numfmt --from=iec-i 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  if [[ "${s:-0}" -gt 0 ]]; then echo "$s"; else echo -1; fi
+}
 
 # ------------------------------
-# 5. Check Helper (paru > yay > pacman)
+# 5. Package manager detection
 # ------------------------------
 if command -v paru >/dev/null 2>&1; then PKG_MNGR=paru
 elif command -v yay >/dev/null 2>&1; then PKG_MNGR=yay
 elif command -v pacman >/dev/null 2>&1; then PKG_MNGR=pacman
 else _error "${MSG[NO_HELPER]}"; fi
 
-# ------------------------------
-# 6. Introduction & Confirmation
-# ------------------------------
-if [[ "$SKIP_CONFIRM" == false ]]; then
-  printf "\n${H_CYAN}%s${NC}\n" "${MSG[INTRO_HEADER]}"
-  printf "%s\n" "${MSG[DESC_TITLE]}"
-  printf "  %s\n" "${MSG[DESC_1]}"
-  printf "  %s\n" "${MSG[DESC_2]}"
-  printf "  %s\n" "${MSG[DESC_3]}"
-  printf "  %s\n" "${MSG[DESC_4]}"
-  printf "  %s\n" "${MSG[DESC_5]}"
-  printf "  %s\n" "${MSG[DESC_6]}"
-  printf "  %s\n" "${MSG[DESC_7]}"
-  
-  if [[ "$CLEAN_ALL" == true ]]; then
-    printf "  ${H_RED}%s${NC}\n" "${MSG[DESC_ALL_1]}"
-    printf "  ${H_RED}%s${NC}\n" "${MSG[DESC_ALL_2]}"
-  fi
-  
-  printf "\n${H_YELLOW}%s ${NC}" "${MSG[ASK_CONFIRM]}"
-  read -r confirm || true
-  case "$confirm" in
-    [yY][eE][sS]|[yY]|"") ;; 
-    *) printf "%s\n" "${MSG[ABORT]}"; exit 0 ;;
-  esac
-fi
+mapfile -t PAC_CACHE_DIRS < <(pacman-conf CacheDir 2>/dev/null | sed 's:/*$::' | grep . || echo /var/cache/pacman/pkg)
 
-# ------------------------------
-# 7. Execution
-# ------------------------------
+paru_clone_dir() {
+  local f v
+  for f in "$CONFIG_HOME/paru/paru.conf" /etc/paru.conf; do
+    [[ -f "$f" ]] || continue
+    v=$(grep -E '^\s*CloneDir\s*=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | xargs || true)
+    [[ -n "$v" ]] && { echo "${v/#\~/$HOME}"; return; }
+  done
+  echo "$CACHE_HOME/paru/clone"
+}
+yay_build_dir() {
+  local v; v=$(yay -Pg 2>/dev/null | grep -oP '"buildDir":\s*"\K[^"]+' || true)
+  echo "${v:-$CACHE_HOME/yay}"
+}
+# a clone dir counts as installed when any pkgname from its .SRCINFO (or its dir name) is installed
+pkgbase_installed() {
+  local d=$1 name=$2 p
+  pacman -Qq "$name" >/dev/null 2>&1 && return 0
+  if [[ -f "$d/.SRCINFO" ]]; then
+    while IFS= read -r p; do pacman -Qq "$p" >/dev/null 2>&1 && return 0; done < <(grep -E '^\s*pkgname\s*=' "$d/.SRCINFO" | cut -d= -f2 | xargs -n1 2>/dev/null)
+  fi
+  return 1
+}
+
+# ======================================================================
+# 6. Steps  (each step lists what it removes; deletion is skipped in PREVIEW)
+# ======================================================================
+
+step_orphans() {
+  step "${MSG[T_ORPHAN]}"
+  local -a targets=() arr=()
+  local orphans opt_orphans debugs base
+  orphans=$(pacman -Qtdq 2>/dev/null || true)
+  if [[ -n "$orphans" ]]; then
+    mapfile -t arr <<< "$orphans"; targets+=("${arr[@]}")
+    item "$(pkgs_installed_bytes "${arr[@]}")" "$(printf "${MSG[ORPHAN_LIST]}" "${#arr[@]}" "$(join_words "${arr[@]}")")"
+  fi
+  if is_all; then
+    opt_orphans=$(comm -13 <(pacman -Qtdq 2>/dev/null | sort) <(pacman -Qttdq 2>/dev/null | sort) || true)
+    if [[ -n "$opt_orphans" ]]; then
+      mapfile -t arr <<< "$opt_orphans"; targets+=("${arr[@]}")
+      item "$(pkgs_installed_bytes "${arr[@]}")" "$(printf "${MSG[ORPHAN_OPT_LIST]}" "${#arr[@]}" "$(join_words "${arr[@]}")")"
+    fi
+  fi
+  debugs=""
+  while IFS= read -r dbg; do
+    base="${dbg%-debug}"; [[ -z "$base" ]] && continue
+    pacman -Qi "$base" >/dev/null 2>&1 || debugs="${debugs:+$debugs }$dbg"
+  done < <(pacman -Qq 2>/dev/null | grep -- '-debug$' || true)
+  if [[ -n "$debugs" ]]; then
+    read -r -a arr <<< "$debugs"; targets+=("${arr[@]}")
+    item "$(pkgs_installed_bytes "${arr[@]}")" "$(printf "${MSG[ORPHAN_DEBUG_LIST]}" "$debugs")"
+  fi
+  if [[ ${#targets[@]} -gt 0 ]]; then
+    run sudo pacman -Rns --noconfirm "${targets[@]}" >/dev/null 2>&1 || true
+  fi
+  step_end
+}
+
+step_pacman_cache() {
+  step "${MSG[T_CACHE]}" "$(join_words "${PAC_CACHE_DIRS[@]}")"
+  if is_all; then
+    local n; n=$(find "${PAC_CACHE_DIRS[@]}" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    item "$(sudo_dir_bytes "${PAC_CACHE_DIRS[@]}")" "$(printf "${MSG[CACHE_ALL_ITEM]}" "$n")"
+    # -Scc's "remove ALL files" prompt defaults to no; --noconfirm would silently skip it, so answer yes
+    if [[ "$PREVIEW" == false ]]; then yes | sudo pacman -Scc >/dev/null 2>&1 || true; fi
+  else
+    local d saved=0 s
+    if command -v paccache >/dev/null 2>&1; then
+      for d in "${PAC_CACHE_DIRS[@]}"; do
+        for s in "$(paccache -d -k1 -c "$d" 2>/dev/null | grep -oP 'disk space saved: \K[^)]+' || true)" \
+                 "$(paccache -d -u -k0 -c "$d" 2>/dev/null | grep -oP 'disk space saved: \K[^)]+' || true)"; do
+          [[ -n "$s" ]] && saved=$(( saved + $(numfmt --from=iec-i "$(echo "$s" | sed 's/ //; s/iB$/i/; s/B$//')" 2>/dev/null || echo 0) ))
+        done
+      done
+    else
+      saved=-1
+    fi
+    if [[ "$saved" -ne 0 ]]; then item "$saved" "${MSG[CACHE_ITEM]}"; fi
+    run sudo pacman -Sc --noconfirm >/dev/null 2>&1 || true
+    for d in "${PAC_CACHE_DIRS[@]}"; do run sudo find "$d" -maxdepth 1 -type d -name 'download-*' -exec rm -rf {} + 2>/dev/null || true; done
+  fi
+  step_end
+}
+
+step_aur_cache() {
+  local -a clone_dirs=()
+  command -v paru >/dev/null 2>&1 && clone_dirs+=("$(paru_clone_dir)")
+  command -v yay  >/dev/null 2>&1 && clone_dirs+=("$(yay_build_dir)")
+  [[ ${#clone_dirs[@]} -eq 0 ]] && return 0
+  local root
+  if is_all; then
+    step "${MSG[T_AUR_ALL]}"
+    for root in "${clone_dirs[@]}"; do
+      [[ -d "$root" ]] || continue
+      local n; n=$(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+      [[ $n -eq 0 ]] && continue
+      item "$(dir_bytes "$root")" "$(printf "${MSG[AUR_ALL_ITEM]}" "$n" "${root/#$HOME/\~}")"
+      rm_contents "$root"
+    done
+    if [[ "$PREVIEW" == false ]]; then
+      command -v paru >/dev/null 2>&1 && { paru -Scc --aur --noconfirm >/dev/null 2>&1 || true; }
+      command -v yay  >/dev/null 2>&1 && { yay  -Scc --aur --noconfirm >/dev/null 2>&1 || true; }
+    fi
+    step_end; return 0
+  fi
+
+  step "${MSG[T_AUR]}"
+  for root in "${clone_dirs[@]}"; do
+    [[ -d "$root" ]] || continue
+    local -a uninstalled=() junk=()
+    local d name j
+    for d in "$root"/*/; do
+      [[ -d "$d" ]] || continue
+      d="${d%/}"; name=$(basename "$d")
+      [[ -f "$d/PKGBUILD" || -f "$d/.SRCINFO" ]] || continue     # only touch real clone dirs
+      if pkgbase_installed "$d" "$name"; then
+        while IFS= read -r -d '' j; do junk+=("$j"); done < <(find "$d" -mindepth 1 -maxdepth 1 \( -type d \( -name src -o -name pkg \) -o -type f \( -name '*.pkg.tar*' -o -name '*.log' \) \) -print0 2>/dev/null)
+      else
+        uninstalled+=("$d")
+      fi
+    done
+    if [[ ${#uninstalled[@]} -gt 0 ]]; then
+      item "$(dir_bytes "${uninstalled[@]}")" "$(printf "${MSG[AUR_UNINSTALLED]}" "$(basename -a "${uninstalled[@]}" | xargs)")"
+      for d in "${uninstalled[@]}"; do run rm -rf -- "${d:?}"; done
+    fi
+    if [[ ${#junk[@]} -gt 0 ]]; then
+      local -A seen=(); local cnt=0
+      for d in "${junk[@]}"; do name=$(basename "$(dirname "$d")"); [[ -z "${seen[$name]:-}" ]] && { seen[$name]=1; cnt=$((cnt+1)); }; done
+      item "$(dir_bytes "${junk[@]}")" "$(printf "${MSG[AUR_BUILD]}" "$cnt")"
+      for d in "${junk[@]}"; do run rm -rf -- "${d:?}"; done
+    fi
+  done
+  step_end
+}
+
+step_journal() {
+  step "${MSG[T_LOG]}"
+  local before after; before=$(journal_usage)
+  item -1 "$(printf "${MSG[LOG_ITEM]}" "$JOURNAL_KEEP_TIME" "$JOURNAL_KEEP_SIZE" "${before:-?}")"
+  if [[ "$PREVIEW" == false ]]; then
+    sudo journalctl --rotate >/dev/null 2>&1 || true
+    sudo journalctl --vacuum-time="$JOURNAL_KEEP_TIME" --vacuum-size="$JOURNAL_KEEP_SIZE" >/dev/null 2>&1 || true
+    after=$(journal_usage)
+    note "$(printf "${MSG[LOG_RESULT]}" "${before:-?}" "${after:-?}")"
+  fi
+  step_end
+}
+
+step_coredump() {
+  local d=/var/lib/systemd/coredump
+  [[ -d "$d" ]] || return 0
+  step "${MSG[T_CORE]}"
+  local n; n=$(sudo find "$d" -maxdepth 1 -type f -name 'core.*' 2>/dev/null | wc -l)
+  if [[ $n -gt 0 ]]; then
+    item "$(sudo_dir_bytes "$d")" "$(printf "${MSG[CORE_ITEM]}" "$n")"
+    run sudo find "$d" -maxdepth 1 -type f -name 'core.*' -delete 2>/dev/null || true
+  fi
+  step_end
+}
+
+step_trash_thumbs() {
+  step "${MSG[T_TRASH]}"
+  local -a trash=()
+  [[ -d "$DATA_HOME/Trash" ]] && trash+=("$DATA_HOME/Trash")
+  local m
+  while IFS= read -r m; do
+    [[ "$m" == /run/media/* || "$m" == /media/* || "$m" == /mnt/* ]] || continue
+    [[ -d "$m/.Trash-$UID_NUM" ]] && trash+=("$m/.Trash-$UID_NUM")
+  done < <(findmnt -rn -o TARGET 2>/dev/null || true)
+  local t bytes
+  for t in "${trash[@]}"; do
+    bytes=$(dir_bytes "$t")
+    [[ "$bytes" -gt 4096 ]] || continue          # empty trash dirs only hold files/ and info/
+    item "$bytes" "$(printf "${MSG[TRASH_ITEM]}" "${t/#$HOME/\~}")"
+    rm_contents "$t"
+  done
+
+  local thumb="$CACHE_HOME/thumbnails"
+  if [[ -d "$thumb" ]]; then
+    local -a cond=(-type f); is_all || cond+=(-mtime "+$THUMB_DAYS")
+    local n; n=$(find "$thumb" -xdev "${cond[@]}" 2>/dev/null | wc -l)
+    if [[ $n -gt 0 ]]; then
+      if is_all; then item "$(find_bytes "$thumb" -xdev "${cond[@]}")" "$(printf "${MSG[THUMB_ALL_ITEM]}" "$n")"
+      else item "$(find_bytes "$thumb" -xdev "${cond[@]}")" "$(printf "${MSG[THUMB_ITEM]}" "$n" "$THUMB_DAYS")"; fi
+      run find "$thumb" -xdev "${cond[@]}" -delete 2>/dev/null || true
+    fi
+  fi
+  step_end
+}
+
+step_flatpak() {
+  command -v flatpak >/dev/null 2>&1 || return 0
+  step "${MSG[T_FLATPAK]}"
+  local unused
+  unused=$(printf 'n\n' | flatpak uninstall --unused 2>/dev/null | grep -oE '\[-\]\s+\S+' | awk '{print $2}' | xargs || true)
+  if [[ -n "$unused" ]]; then
+    item -1 "$(printf "${MSG[FLATPAK_ITEM]}" "$unused")"
+    run flatpak uninstall --unused -y >/dev/null 2>&1 || true
+  fi
+  if is_all && [[ -d "$HOME/.var/app" ]]; then
+    local installed; installed=$(flatpak list --app --columns=application 2>/dev/null || true)
+    local -a orphan=() caches=()
+    local d id
+    for d in "$HOME"/.var/app/*/; do
+      [[ -d "$d" ]] || continue; d="${d%/}"; id=$(basename "$d")
+      if grep -qxF "$id" <<< "$installed"; then
+        [[ -d "$d/cache" ]] && caches+=("$d/cache")
+      else
+        orphan+=("$d")
+      fi
+    done
+    if [[ ${#orphan[@]} -gt 0 ]]; then
+      item "$(dir_bytes "${orphan[@]}")" "$(printf "${MSG[FLATPAK_ORPHAN_ITEM]}" "${#orphan[@]}" "$(basename -a "${orphan[@]}" | xargs)")"
+      for d in "${orphan[@]}"; do run rm -rf -- "${d:?}"; done
+    fi
+    if [[ ${#caches[@]} -gt 0 ]]; then
+      item "$(dir_bytes "${caches[@]}")" "${MSG[FLATPAK_APPCACHE_ITEM]}"
+      for d in "${caches[@]}"; do rm_contents "$d"; done
+    fi
+  fi
+  step_end
+}
+
+step_media() {
+  local pics="" vids=""
+  if command -v xdg-user-dir >/dev/null 2>&1; then pics=$(xdg-user-dir PICTURES); vids=$(xdg-user-dir VIDEOS); fi
+  # xdg-user-dir falls back to $HOME itself when a dir is not configured
+  [[ -z "$pics" || "$pics" == "$HOME" ]] && pics="$HOME/Pictures"
+  [[ -z "$vids" || "$vids" == "$HOME" ]] && vids="$HOME/Videos"
+  local -a dirs=("$pics/Screenshots" "$vids/wf-recorder" "$vids/shorin-screenrec-menu")
+  local -a cond=(-type f)
+  if [[ "$MEDIA_DAYS" -gt 0 ]]; then step "${MSG[T_MEDIA]}" "$MEDIA_DAYS"; cond+=(-mtime "+$MEDIA_DAYS")
+  else step "${MSG[T_MEDIA_ALL]}"; fi
+  local d n
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    n=$(find "$d" -xdev "${cond[@]}" 2>/dev/null | wc -l)
+    [[ $n -eq 0 ]] && continue
+    item "$(find_bytes "$d" -xdev "${cond[@]}")" "$(printf "${MSG[MEDIA_ITEM]}" "${d/#$HOME/\~}" "$n")"
+    run find "$d" -xdev "${cond[@]}" -delete 2>/dev/null || true
+    run find "$d" -xdev -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  done
+  step_end
+}
+
+snapper_configs() { sudo LC_ALL=C snapper list-configs 2>/dev/null | awk -F '|' 'NR>2 {print $1}' | xargs -n1 2>/dev/null || true; }
+
+step_snapshots() {
+  command -v btrfs >/dev/null 2>&1 && findmnt -f -n -o FSTYPE / | grep -q btrfs || return 0
+  if command -v snapper >/dev/null 2>&1; then
+    local conf
+    if is_all; then
+      step "${MSG[T_SNAP_ALL]}"
+      while IFS= read -r conf; do
+        [[ -z "$conf" ]] && continue
+        if ! snapper -c "$conf" get-config >/dev/null 2>&1; then
+          run sudo snapper -c "$conf" set-config ALLOW_GROUPS=wheel SYNC_ACL=yes >/dev/null 2>&1 || true
+        fi
+        local -a ids=()
+        while IFS='|' read -r snap_id _ _ _ _ _ snap_desc _; do
+          snap_id=$(echo "$snap_id" | xargs); snap_desc=$(echo "$snap_desc" | xargs)
+          [[ ! "$snap_id" =~ ^[0-9]+$ ]] && continue
+          [[ "$snap_id" == "0" ]] && continue                 # 0 is the live system
+          [[ "${snap_desc,,}" == before* ]] && continue        # keep 'Before' nodes
+          ids+=("$snap_id")
+        done < <(sudo LC_ALL=C snapper -c "$conf" list 2>/dev/null)
+        [[ ${#ids[@]} -eq 0 ]] && continue
+        item -1 "$(printf "${MSG[SNAP_ALL_ITEM]}" "$conf" "${#ids[@]}" "$(printf '#%s ' "${ids[@]}" | xargs)")"
+        if [[ "$PREVIEW" == false ]]; then
+          sudo snapper -c "$conf" delete "${ids[@]}" >/dev/null 2>&1 || true
+        fi
+      done < <(snapper_configs)
+    else
+      step "${MSG[T_SNAP]}"
+      while IFS= read -r conf; do
+        [[ -z "$conf" ]] && continue
+        item -1 "$(printf "${MSG[SNAP_ITEM]}" "$conf")"
+        if [[ "$PREVIEW" == false ]]; then
+          sudo snapper -c "$conf" cleanup number >/dev/null 2>&1 || true
+          sudo snapper -c "$conf" cleanup timeline >/dev/null 2>&1 || true
+          sudo snapper -c "$conf" cleanup empty-pre-post >/dev/null 2>&1 || true
+        fi
+      done < <(snapper_configs)
+    fi
+    step_end
+  fi
+
+  # btrfs-assistant backups (*_backup_20*) at the top level of the filesystem
+  step "${MSG[T_BTRFS_BA]}"
+  local dev mnt; dev=$(findmnt -n -o SOURCE / | cut -d'[' -f1); mnt=$(mktemp -d /tmp/btrfs_clean_XXXX)
+  if sudo mount -t btrfs -o subvolid=5 "$dev" "$mnt" 2>/dev/null; then
+    local -a subvols=(); local s
+    while IFS= read -r -d '' s; do sudo btrfs subvolume show "$s" >/dev/null 2>&1 && subvols+=("$s"); done \
+      < <(sudo find "$mnt" -maxdepth 1 -type d -name "*_backup_20*" -print0 2>/dev/null | sort -z)
+    if [[ ${#subvols[@]} -gt 0 ]] && ! is_all; then
+      note "$(printf "${MSG[BTRFS_BA_KEEP]}" "$(basename "${subvols[-1]}")")"
+      unset 'subvols[-1]'
+    fi
+    for s in "${subvols[@]}"; do
+      item -1 "$(basename "$s")"
+      run sudo btrfs subvolume delete "$s" >/dev/null 2>&1 || true
+    done
+    sudo umount "$mnt" 2>/dev/null || true
+  fi
+  rmdir "$mnt" 2>/dev/null || true
+  if [[ "$PREVIEW" == false ]]; then sudo btrfs filesystem sync / >/dev/null 2>&1 || true; fi
+  step_end
+}
+
+# ---- dev caches: official prune commands only, never project directories ----
+step_dev_caches() {
+  is_dev || return 0
+  step "${MSG[T_DEV]}"
+  local dir
+
+  dev_item() { # dev_item BYTES LABEL CMD...
+    local bytes=$1 label=$2; shift 2
+    item "$bytes" "$label"
+    if [[ "$PREVIEW" == false ]]; then "$@" >/dev/null 2>&1 || true; fi
+  }
+  wipe_dir() { find "$1" -mindepth 1 -xdev -delete; }
+
+  if command -v npm >/dev/null 2>&1; then
+    dir=$(npm config get cache 2>/dev/null || true); [[ -d "${dir:-/nonexistent}/_cacache" ]] && dev_item "$(dir_bytes "$dir/_cacache")" "npm cache  ${dir/#$HOME/\~}" npm cache clean --force
+  fi
+  if command -v pnpm >/dev/null 2>&1; then
+    dir=$(pnpm store path 2>/dev/null || true); [[ -d "${dir:-/nonexistent}" ]] && dev_item -1 "pnpm store prune  ${dir/#$HOME/\~}" pnpm store prune
+  fi
+  if command -v yarn >/dev/null 2>&1; then
+    dir=$(yarn cache dir 2>/dev/null || true); [[ -d "${dir:-/nonexistent}" ]] && dev_item "$(dir_bytes "$dir")" "yarn cache  ${dir/#$HOME/\~}" yarn cache clean
+  fi
+  if command -v bun >/dev/null 2>&1; then
+    dir="$HOME/.bun/install/cache"; [[ -d "$dir" ]] && dev_item "$(dir_bytes "$dir")" "bun cache  ${dir/#$HOME/\~}" bun pm cache rm
+  fi
+  if command -v pip >/dev/null 2>&1; then
+    dir=$(pip cache dir 2>/dev/null || true); [[ -d "${dir:-/nonexistent}" ]] && dev_item "$(dir_bytes "$dir")" "pip cache  ${dir/#$HOME/\~}" pip cache purge
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    dir=$(uv cache dir 2>/dev/null || true)
+    if [[ -d "${dir:-/nonexistent}" ]]; then
+      if is_all; then dev_item "$(dir_bytes "$dir")" "uv cache clean  ${dir/#$HOME/\~}" uv cache clean
+      else dev_item -1 "uv cache prune  ${dir/#$HOME/\~}" uv cache prune; fi
+    fi
+  fi
+  if command -v cargo >/dev/null 2>&1; then
+    local ch="${CARGO_HOME:-$HOME/.cargo}"; local -a cd=()
+    for dir in "$ch/registry/cache" "$ch/registry/src" "$ch/git/checkouts"; do [[ -d "$dir" ]] && cd+=("$dir"); done
+    [[ ${#cd[@]} -gt 0 ]] && dev_item "$(dir_bytes "${cd[@]}")" "cargo registry cache / src, git checkouts  ${ch/#$HOME/\~}" bash -c 'for d in "$@"; do find "$d" -mindepth 1 -xdev -delete; done' _ "${cd[@]}"
+  fi
+  if command -v go >/dev/null 2>&1; then
+    local gm gc; gm=$(go env GOMODCACHE 2>/dev/null || true); gc=$(go env GOCACHE 2>/dev/null || true)
+    [[ -d "${gm:-/nonexistent}" || -d "${gc:-/nonexistent}" ]] && dev_item "$(dir_bytes "${gm:-/nonexistent}" "${gc:-/nonexistent}")" "go module & build cache" go clean -modcache -cache
+  fi
+  local gh="${GRADLE_USER_HOME:-$HOME/.gradle}"
+  [[ -d "$gh/caches" ]] && dev_item "$(dir_bytes "$gh/caches")" "gradle caches  ${gh/#$HOME/\~}/caches" wipe_dir "$gh/caches"
+  is_all && [[ -d "$gh/wrapper/dists" ]] && dev_item "$(dir_bytes "$gh/wrapper/dists")" "gradle wrapper dists" wipe_dir "$gh/wrapper/dists"
+  if command -v conda >/dev/null 2>&1; then dev_item -1 "conda clean --all" conda clean -ay; fi
+
+  local eng
+  for eng in docker podman; do
+    command -v "$eng" >/dev/null 2>&1 || continue
+    "$eng" info >/dev/null 2>&1 || continue
+    if is_all; then
+      local recl recl_b; recl=$("$eng" system df 2>/dev/null | awk 'NR>1 && $1=="Images"{print $(NF-1)}' || true)
+      recl_b=$(numfmt --from=si "${recl%B}" 2>/dev/null || echo -1)
+      dev_item "$recl_b" "$(printf "${MSG[DOCKER_ALL_ITEM]}" "$eng")" bash -c '"$1" image prune -af && "$1" builder prune -af' _ "$eng"
+    else
+      dev_item -1 "$(printf "${MSG[DOCKER_ITEM]}" "$eng")" bash -c '"$1" image prune -f && "$1" builder prune -f' _ "$eng"
+    fi
+  done
+
+  if command -v debtap >/dev/null 2>&1 && [[ -d /var/cache/debtap ]]; then
+    dev_item "$(sudo_dir_bytes /var/cache/debtap)" "debtap database  /var/cache/debtap (rebuilt by debtap -u)" sudo find /var/cache/debtap -mindepth 1 -xdev -delete
+  fi
+  for dir in "$CACHE_HOME/zig" "$CACHE_HOME/node-gyp" "$CACHE_HOME/electron" "$CACHE_HOME/electron-builder"; do
+    [[ -d "$dir" ]] && [[ "$(dir_bytes "$dir")" -gt 4096 ]] && dev_item "$(dir_bytes "$dir")" "${dir/#$HOME/\~}" wipe_dir "$dir"
+  done
+  if is_all && [[ -d "$CACHE_HOME/ms-playwright" ]]; then
+    dev_item "$(dir_bytes "$CACHE_HOME/ms-playwright")" "playwright browsers  ~/.cache/ms-playwright" wipe_dir "$CACHE_HOME/ms-playwright"
+  fi
+  step_end
+}
+
+# ---- all mode: Electron app & browser caches, skipping running apps ----
+step_app_caches() {
+  is_all || return 0
+  step "${MSG[T_APPCACHE]}"
+  declare -A by_app=()
+  local p app
+  while IFS= read -r -d '' p; do
+    app="${p#$CONFIG_HOME/}"; app="${app%%/*}"
+    by_app[$app]="${by_app[$app]:-}${by_app[$app]:+$'\n'}$p"
+  done < <(find "$CONFIG_HOME" -mindepth 2 -maxdepth 3 -type d \( -name Cache -o -name 'Code Cache' -o -name GPUCache -o -name DawnCache -o -name DawnGraphiteCache -o -name DawnWebGPUCache -o -name CachedData \) -print0 2>/dev/null)
+  while IFS= read -r -d '' p; do
+    app="${p#$CACHE_HOME/}"; app="${app%%/*}"
+    by_app[$app]="${by_app[$app]:-}${by_app[$app]:+$'\n'}$p"
+  done < <(find "$CACHE_HOME" -mindepth 2 -maxdepth 4 -type d \( -name Cache -o -name 'Code Cache' -o -name GPUCache -o -name cache2 \) -print0 2>/dev/null)
+
+  declare -A proc_name=([mozilla]=firefox [BraveSoftware]=brave [google-chrome]=chrome [microsoft-edge]=msedge [google-chrome-headless]=chrome)
+  local pid
+  while IFS= read -r app; do
+    [[ -z "$app" ]] && continue
+    local -a dirs; mapfile -t dirs <<< "${by_app[$app]}"
+    pid=$(app_running "${proc_name[$app]:-$app}")
+    if [[ -n "$pid" ]]; then _skip "${MSG[APPCACHE_RUNNING]}" "$app"; continue; fi
+    local bytes; bytes=$(dir_bytes "${dirs[@]}")
+    [[ "$bytes" -gt 65536 ]] || continue        # skip apps whose caches are effectively empty
+    item "$bytes" "$(printf "${MSG[APPCACHE_ITEM]}" "$app" "${#dirs[@]}")"
+    for p in "${dirs[@]}"; do rm_contents "$p"; done
+  done < <(printf '%s\n' "${!by_app[@]}" | sort -f)
+  step_end
+}
+
+step_misc_all() {
+  is_all || return 0
+  step "${MSG[T_MISC]}"
+  if command -v cliphist >/dev/null 2>&1 && [[ -f "$CACHE_HOME/cliphist/db" ]]; then
+    item "$(dir_bytes "$CACHE_HOME/cliphist")" "${MSG[CLIP_ITEM]}"; run cliphist wipe >/dev/null 2>&1 || true
+  fi
+  local bctl; bctl=$(command -v balooctl6 || command -v balooctl || true)
+  if [[ -n "$bctl" && -d "$DATA_HOME/baloo" ]]; then
+    item "$(dir_bytes "$DATA_HOME/baloo")" "$(printf "${MSG[INDEX_ITEM]}" baloo)"; run "$bctl" purge >/dev/null 2>&1 || true
+  fi
+  if command -v tracker3 >/dev/null 2>&1 && [[ -d "$CACHE_HOME/tracker3" ]]; then
+    item "$(dir_bytes "$CACHE_HOME/tracker3")" "$(printf "${MSG[INDEX_ITEM]}" tracker3)"
+    if [[ "$PREVIEW" == false ]]; then yes 2>/dev/null | tracker3 reset --filesystem >/dev/null 2>&1 || true; fi
+  fi
+  step_end
+}
+
+run_all_steps() {
+  step_orphans
+  step_pacman_cache
+  step_aur_cache
+  step_journal
+  step_coredump
+  step_trash_thumbs
+  step_flatpak
+  step_media
+  step_dev_caches
+  step_app_caches
+  step_misc_all
+  step_snapshots
+}
+
+# ======================================================================
+# 7. Intro, confirmation, execution
+# ======================================================================
+mode_label() { case "$MODE" in all) echo "${MSG[MODE_ALL]}";; dev) echo "${MSG[MODE_DEV]}";; *) echo "${MSG[MODE_NORMAL]}";; esac; }
+
+AVAIL_BEFORE=$(avail_bytes)
+printf "\n${H_CYAN}%s${NC}\n" "${MSG[INTRO_HEADER]}"
+printf "${MSG[MODE_LINE]}" "$(mode_label)"
+[[ "$DRY_RUN" == true ]] && printf "  ${H_YELLOW}%s${NC}" "${MSG[PREVIEW_TAG]}"
+printf "    ${MSG[AVAIL]}\n" "$(fmt_bytes "$AVAIL_BEFORE")"
+
+if [[ "$DRY_RUN" == false ]] && { is_all || [[ "$SKIP_CONFIRM" == false ]]; }; then
+  printf "%s\n" "${MSG[DESC_TITLE]}"
+  printf "  %s\n" "${MSG[DESC_1]}" "${MSG[DESC_2]}" "${MSG[DESC_3]}"
+  printf "  ${MSG[DESC_4]}\n" "$JOURNAL_KEEP_TIME" "$JOURNAL_KEEP_SIZE"
+  printf "  %s\n" "${MSG[DESC_5]}"
+  printf "  ${MSG[DESC_6]}\n" "$THUMB_DAYS"
+  printf "  %s\n" "${MSG[DESC_7]}"
+  if [[ "$MEDIA_DAYS" -gt 0 ]]; then printf "  ${MSG[DESC_8]}\n" "$MEDIA_DAYS"; else printf "  %s\n" "${MSG[DESC_8_ALL]}"; fi
+  printf "  %s\n" "${MSG[DESC_9]}"
+  is_dev && printf "  ${H_YELLOW}%s${NC}\n" "${MSG[DESC_DEV]}"
+  if is_all; then
+    printf "  ${H_RED}%s${NC}\n" "${MSG[DESC_ALL_1]}" "${MSG[DESC_ALL_2]}" "${MSG[DESC_ALL_3]}"
+    # ALL mode always asks, regardless of --yes
+    printf "\n${H_RED}%s ${NC}" "${MSG[ASK_CONFIRM_ALL]}"
+    read -r confirm || true
+    case "$confirm" in [yY][eE][sS]|[yY]) ;; *) printf "%s\n" "${MSG[ABORT]}"; exit 0 ;; esac
+  else
+    printf "${DIM}%s${NC}\n" "${MSG[DESC_HINT]}"
+    printf "\n${H_YELLOW}%s ${NC}" "${MSG[ASK_CONFIRM]}"
+    read -r confirm || true
+    case "$confirm" in [yY][eE][sS]|[yY]|"") ;; *) printf "%s\n" "${MSG[ABORT]}"; exit 0 ;; esac
+  fi
+fi
+printf "\n"
 _info "${MSG[HELPER_USE]}" "$PKG_MNGR"
 
-# Keep Sudo Alive
-if sudo -v; then
-  while true; do sudo -n true; sleep 60; done 2>/dev/null &
+# sudo keep-alive (needed for preview too: journal size, coredump, snapper)
+if sudo -n true 2>/dev/null || sudo -v; then
+  ( while true; do sudo -n true; sleep 60; done ) >/dev/null 2>&1 &
   SUDO_PID=$!
-  trap 'kill $SUDO_PID 2>/dev/null || true' EXIT
+  trap 'pkill -P $SUDO_PID 2>/dev/null; kill $SUDO_PID 2>/dev/null || true' EXIT
 else
-  _error "Sudo failed."
+  _error "${MSG[SUDO_FAIL]}"
 fi
 
-# [1] Orphans & 孤儿 debug 包 (利用 mapfile 与 Bash 数组处理)
-_info "${MSG[STEP_ORPHAN]}"
-
-# 收集传统孤儿包 (作为依赖安装但不再被任何包需要)
-ORPHANS=$(pacman -Qtdq || true)
-
-# 收集无主包的 -debug 符号包 (主包已卸载，debug 包残留)
-ORPHAN_DEBUGS=""
-while IFS= read -r dbg_pkg; do
-  base="${dbg_pkg%-debug}"
-  [[ -z "$base" ]] && continue
-  if ! pacman -Qi "$base" >/dev/null 2>&1; then
-    ORPHAN_DEBUGS="${ORPHAN_DEBUGS:+$ORPHAN_DEBUGS$'\n'}$dbg_pkg"
-  fi
-done < <(pacman -Qq 2>/dev/null | grep -- '-debug$' || true)
-
-# 合并两类孤儿包并一次性清理
-ALL_ORPHANS=""
-if [[ -n "$ORPHANS" ]]; then
-  _warn "${MSG[ORPHAN_FOUND]}"
-  ALL_ORPHANS="$ORPHANS"
-fi
-if [[ -n "$ORPHAN_DEBUGS" ]]; then
-  _warn "${MSG[ORPHAN_DEBUG_FOUND]}"
-  ALL_ORPHANS="${ALL_ORPHANS:+$ALL_ORPHANS$'\n'}$ORPHAN_DEBUGS"
-fi
-
-if [[ -n "$ALL_ORPHANS" ]]; then
-  mapfile -t ORPHAN_ARR <<< "$ALL_ORPHANS"
-  $PKG_MNGR -Rns --noconfirm "${ORPHAN_ARR[@]}"
-  _success "${MSG[ORPHAN_CLEAN]}"
-else
-  _success "${MSG[ORPHAN_NONE]}"
-fi
-
-# [2] Cache (彻底修复清理不净的问题)
-if [[ "$CLEAN_ALL" == true ]]; then
-  _info "${MSG[STEP_CACHE_ALL]}"
-  
-  # 1. 使用 sudo 清理 pacman 官方仓库缓存 (彻底)
-  # 注意: -Scc 的"删除全部"提示默认答案为 no，--noconfirm 会静默跳过(等于没清)，必须用 yes 强制确认
-  yes | sudo pacman -Scc >/dev/null 2>&1 || true
-  
-  # 2. 清理 AUR 助手缓存并暴力铲除本地 git 源码克隆
-  if command -v yay >/dev/null 2>&1; then
-    yay -Scc --aur --noconfirm >/dev/null 2>&1 || true
-    rm -rf "$HOME/.cache/yay"/* >/dev/null 2>&1 || true
-  fi
-  if command -v paru >/dev/null 2>&1; then
-    paru -Scc --aur --noconfirm >/dev/null 2>&1 || true
-    rm -rf "$HOME/.cache/paru/clone"/* >/dev/null 2>&1 || true
-  fi
-  
-  _success "${MSG[CACHE_ALL_DONE]}"
-else
-  _info "${MSG[STEP_CACHE]}"
-  
-  # 1. 使用 sudo 清理 pacman 官方仓库缓存 (仅限未安装版本)
-  sudo pacman -Sc --noconfirm >/dev/null 2>&1 || true
-  
-  # 2. 清理 AUR 助手的对应缓存
-  if [[ "$PKG_MNGR" == "yay" ]]; then
-    yay -Sc --aur --noconfirm >/dev/null 2>&1 || true
-  elif [[ "$PKG_MNGR" == "paru" ]]; then
-    paru -Sc --aur --noconfirm >/dev/null 2>&1 || true
-  fi
-  
-  _success "${MSG[CACHE_DONE]}"
-fi
-
-# [3] Broken Downloads (化繁为简：find 一行流删除)
-TARGET_DIR="/var/cache/pacman/pkg"
-if [[ -d "$TARGET_DIR" ]]; then
-  _info "${MSG[STEP_BROKEN]}"
-  sudo find "$TARGET_DIR" -maxdepth 1 -type d -name "download-*" -exec rm -rf {} + 2>/dev/null || true
-  _success "${MSG[BROKEN_DONE]}"
-fi
-
-# [4] Journal
-_info "${MSG[STEP_LOG]}"
-sudo journalctl --vacuum-time=2weeks >/dev/null 2>&1 || true
-_success "${MSG[LOG_DONE]}"
-
-# [5] Trash & Thumbnails
-_info "${MSG[STEP_TRASH]}"
-TRASH_DIR="$HOME/.local/share/Trash"
-THUMB_DIR="$HOME/.cache/thumbnails"
-CLIP_DIR="$HOME/.cache/shorinclip"
-
-[[ -d "$TRASH_DIR" ]] && find "$TRASH_DIR" -mindepth 1 -delete 2>/dev/null || true
-_success "${MSG[TRASH_DONE]}"
-
-[[ -d "$THUMB_DIR" ]] && find "$THUMB_DIR" -type f -atime +30 -delete 2>/dev/null || true
-_success "${MSG[THUMB_DONE]}"
-
-[[ -d "$CLIP_DIR" ]] && find "$CLIP_DIR" -type f -atime +30 -delete 2>/dev/null || true
-_success "${MSG[CLIP_DONE]}"
-
-# [6] Flatpak
-if command -v flatpak >/dev/null 2>&1; then
-  _info "${MSG[STEP_FLATPAK]}"
-  flatpak uninstall --unused -y >/dev/null 2>&1 || true
-  _success "${MSG[FLATPAK_DONE]}"
-fi
-
-# [7] Screenshots, wf-recorder & shorin-screenrec
-_info "${MSG[STEP_MEDIA]}"
-SCREENSHOTS_DIR="$HOME/Pictures/Screenshots"
-RECORDS_DIR="$HOME/Videos/wf-recorder"
-SHORIN_RECORDS_DIR="$HOME/Videos/shorin-screenrec-menu"
-
-[[ -d "$SCREENSHOTS_DIR" ]] && find "$SCREENSHOTS_DIR" -mindepth 1 -delete 2>/dev/null || true
-[[ -d "$RECORDS_DIR" ]] && find "$RECORDS_DIR" -mindepth 1 -delete 2>/dev/null || true
-[[ -d "$SHORIN_RECORDS_DIR" ]] && find "$SHORIN_RECORDS_DIR" -mindepth 1 -delete 2>/dev/null || true
-_success "${MSG[MEDIA_DONE]}"
-
-# [8] Btrfs Snapshots & Backup Subvolumes
-if command -v btrfs >/dev/null 2>&1 && findmnt -f -n -o FSTYPE / | grep -q btrfs; then
-  
-  # 8.1 Snapper Snapshots
-  if command -v snapper >/dev/null 2>&1; then
-    if [[ "$CLEAN_ALL" == true ]]; then
-      _info "${MSG[STEP_CLEAR_SNAP]}"
-      
-      # 强制使用 LC_ALL=C 能够防止因为本地化差异导致表格列分隔符变成特殊字符
-      while IFS= read -r conf; do
-        conf=$(echo "$conf" | xargs)
-        [[ -z "$conf" ]] && continue
-        
-        # 判断当前执行用户是否有权获取配置
-        if ! snapper -c "$conf" get-config >/dev/null 2>&1; then
-          sudo snapper -c "$conf" set-config ALLOW_GROUPS=wheel SYNC_ACL=yes >/dev/null 2>&1 || true
-        fi
-        
-        # 解析快照列表并清理 (LC_ALL=C 强制以标准竖线 | 作为分隔符，安全健壮)
-        while IFS='|' read -r snap_id snap_type snap_pre snap_date snap_user snap_cleanup snap_desc snap_userdata; do
-          snap_id=$(echo "$snap_id" | xargs)
-          snap_desc=$(echo "$snap_desc" | xargs)
-
-          # 过滤表头横线以及非数字的 ID
-          [[ ! "$snap_id" =~ ^[0-9]+$ ]] && continue
-          # 0 永远是指向当前系统的节点，绝不能删除
-          [[ "$snap_id" == "0" ]] && continue
-
-          # 【核心逻辑】：如果描述以 Before 或 before 开头，则保留该节点
-          if [[ "${snap_desc,,}" == before* ]]; then
-            continue
-          fi
-
-          # 调用原生 snapper delete 批量移除符合条件的废弃快照并打印炫酷日志
-          if sudo snapper -c "$conf" delete "$snap_id" >/dev/null 2>&1; then
-            # 兼容空描述的情况，防止日志错位
-            [[ -z "$snap_desc" ]] && snap_desc="N/A"
-            printf "  ${H_CYAN}Removed Snapshot:${NC} [%-4s] ID: %-3s | Desc: %s\n" "$conf" "$snap_id" "$snap_desc"
-          fi
-        done < <(sudo LC_ALL=C snapper -c "$conf" list 2>/dev/null)
-        
-      done < <(sudo LC_ALL=C snapper list-configs 2>/dev/null | awk -F '|' 'NR>2 {print $1}')
-      _success "${MSG[CLEAR_SNAP_DONE]}"
-      
-    else
-      # 普通模式执行内置自动清理规则
-      _info "${MSG[STEP_SNAP]}"
-      while IFS= read -r conf; do
-        conf=$(echo "$conf" | xargs)
-        [[ -z "$conf" ]] && continue
-        if sudo snapper -c "$conf" cleanup number >/dev/null 2>&1 && sudo snapper -c "$conf" cleanup timeline >/dev/null 2>&1; then
-           printf "  ${H_CYAN}Auto-Cleanup Executed:${NC} [%-4s]\n" "$conf"
-        fi
-      done < <(sudo LC_ALL=C snapper list-configs 2>/dev/null | awk -F '|' 'NR>2 {print $1}')
-      _success "${MSG[SNAP_DONE]}"
-    fi
-  fi
-
-  # 8.2 btrfs-assistant backups (解决 Root 权限读取挂载点问题)
-  _info "${MSG[STEP_BTRFS_BA]}"
-  BTRFS_ROOT_DEV=$(findmnt -n -o SOURCE / | cut -d'[' -f1)
-  MNT_DIR=$(mktemp -d /tmp/btrfs_clean_XXXX)
-  
-  if sudo mount -t btrfs -o subvolid=5 "$BTRFS_ROOT_DEV" "$MNT_DIR" 2>/dev/null; then
-    found_backups=0
-    # 必须使用 sudo find 防止因为顶层目录权限过严导致查不出结果
-    while IFS= read -r -d '' subvol_dir; do
-      if sudo btrfs subvolume show "$subvol_dir" >/dev/null 2>&1; then
-        sudo btrfs subvolume delete "$subvol_dir" >/dev/null 2>&1 || true
-        printf "  ${H_CYAN}Removed Backup Subvol:${NC} %s\n" "$(basename "$subvol_dir")"
-        found_backups=1
-      fi
-    done < <(sudo find "$MNT_DIR" -maxdepth 1 -type d -name "*_backup_20*" -print0 2>/dev/null)
-    
-    sudo umount "$MNT_DIR" || true
-    rmdir "$MNT_DIR" || true
-    
-    if [[ $found_backups -eq 1 ]]; then
-      _success "${MSG[BTRFS_BA_DONE]}"
-    else
-      _success "${MSG[BTRFS_BA_NONE]}"
-    fi
-  else
-    rmdir "$MNT_DIR" || true
-  fi
-fi
+[[ "$DRY_RUN" == true ]] && PREVIEW=true
+run_all_steps
 
 printf "\n"
-_success "${MSG[DONE]}"
+if [[ "$PREVIEW" == true ]]; then
+  _preview "${MSG[DRY_DONE]}" "$(fmt_bytes "$TOTAL_BYTES")"
+else
+  sync
+  AVAIL_AFTER=$(avail_bytes)
+  _success "${MSG[DONE]}" "$(fmt_bytes "$TOTAL_BYTES")" "$(fmt_bytes "$AVAIL_BEFORE")" "$(fmt_bytes "$AVAIL_AFTER")"
+  if findmnt -f -n -o FSTYPE / | grep -q btrfs && command -v snapper >/dev/null 2>&1; then
+    printf "%s${DIM}%s${NC}\n" "$INDENT" "${MSG[BTRFS_NOTE]}"
+  fi
+fi
