@@ -308,13 +308,13 @@ avail_bytes() {
   echo "$total"
 }
 
-# Tags are padded by display width (CJK = 2 columns), so text always starts at column 11
-TAG_COL=10
-pad_tag() {
-  local t=$1 bytes wide
-  bytes=$(printf '%s' "$t" | wc -c); wide=$(( (bytes - ${#t}) / 2 ))      # UTF-8 CJK: 3 bytes, 2 columns
-  printf '%s%*s' "$t" $(( TAG_COL - ${#t} - wide > 0 ? TAG_COL - ${#t} - wide : 0 )) ''
-}
+# Tags are padded by display width (CJK = 2 columns) to the widest tag of the language + 2,
+# so message text and item lines share the same column in both languages
+disp_width() { local t=$1 bytes; bytes=$(printf '%s' "$t" | wc -c); echo $(( ${#t} + (bytes - ${#t}) / 2 )); }   # UTF-8 CJK: 3 bytes, 2 columns
+TAG_COL=0
+for _t in "$TAG_INFO" "$TAG_SUCCESS" "$TAG_WARN" "$TAG_SKIP" "$TAG_PREVIEW"; do _w=$(disp_width "$_t"); [[ $_w -gt $TAG_COL ]] && TAG_COL=$_w; done
+TAG_COL=$(( TAG_COL + 2 ))
+pad_tag() { local t=$1; printf '%s%*s' "$t" $(( TAG_COL - $(disp_width "$t") )) ''; }
 printf -v INDENT '%*s' $(( TAG_COL + 1 )) ''
 _info()    { local fmt=$1; shift; printf "${H_BLUE}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_INFO")" "$@"; }
 _success() { local fmt=$1; shift; printf "${H_GREEN}%s${NC} ${fmt}\n" "$(pad_tag "$TAG_SUCCESS")" "$@"; }
