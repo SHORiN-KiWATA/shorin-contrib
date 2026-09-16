@@ -10,7 +10,7 @@
 #   --dry-run      仅列出将删除的内容与预计释放空间，不执行任何删除
 #
 # 【日常模式功能 / Default mode】
-# 1. 移除孤儿软件包与无主 debug 符号包 (Orphans & orphaned debug packages)
+# 1. 移除孤儿软件包与无主 debug 符号包 (先列出完整清单并单独确认)
 # 2. 清理软件包缓存 (仅保留已安装版本；all 模式完全清空)
 # 3. 清理 AUR 构建残留 (删除未安装的克隆及已安装克隆中的 src/pkg/构建产物，保留 git 仓库)
 # 4. 清理 systemd 日志 (先轮转再按 2 周 / 300M 收缩)
@@ -24,6 +24,7 @@
 # - 路径从 pacman-conf / paru.conf / yay -Pg / xdg-user-dir 读取，不写死
 # - 开发缓存只用工具自带的 prune 命令，从不进入项目目录
 # - 正在运行的应用其缓存目录跳过
+# - 删除软件包前逐个列出名称/体积/说明并单独确认 (--yes 跳过该确认)
 # - all 模式总是需要确认 (--yes 无效)
 # - 按实际删除的文件体积统计，结尾给出可用空间变化
 #   (Btrfs 上被快照引用的数据要等快照删除后才真正释放)
@@ -62,7 +63,7 @@ Modes:
 
 Options:
   --dry-run, -n      Only list what would be removed and the estimated space
-  --yes, -y          Skip confirmation (normal/dev modes; 'all' always asks)
+  --yes, -y          Skip confirmations, incl. the orphan removal list (normal/dev; 'all' always asks)
   --media-days N     Only delete screenshots/recordings older than N days (default 7, 0 = all)
   --ui-lang zh|en    Force UI language (default: auto)
   --help, -h         Show this help and exit
@@ -128,9 +129,14 @@ if [[ "$UI_LANG" == "zh" ]]; then
   MSG[NO_HELPER]="未找到受支持的包管理器 (需要 paru, yay 或 pacman)"
 
   MSG[T_ORPHAN]="正在检查孤儿软件包..."
-  MSG[ORPHAN_LIST]="%s 个孤儿包：%s"
-  MSG[ORPHAN_OPT_LIST]="%s 个仅被可选依赖引用的包：%s"
-  MSG[ORPHAN_DEBUG_LIST]="无主 debug 包：%s"
+  MSG[ORPHAN_SUMMARY]="将删除以下 %s 个软件包 (共 %s)："
+  MSG[ORPHAN_GRP_HEAD]="%s：%s 个 (%s)"
+  MSG[ORPHAN_GRP]="孤儿包 (已无其他包依赖)"
+  MSG[ORPHAN_GRP_OPT]="仅被可选依赖引用"
+  MSG[ORPHAN_GRP_DEBUG]="无主 debug 符号包"
+  MSG[ORPHAN_ASK]="确认删除以上软件包？[y/N]"
+  MSG[ORPHAN_SKIPPED]="已保留全部软件包，未删除。"
+  MSG[ORPHAN_FAIL]="删除失败：%s"
   MSG[T_CACHE]="正在清理软件包缓存 (%s)..."
   MSG[CACHE_ITEM]="旧版本 / 已卸载的包"
   MSG[CACHE_ALL_ITEM]="全部 %s 个文件 (下次操作前需 pacman -Sy)"
@@ -209,9 +215,14 @@ else
   MSG[NO_HELPER]="No supported package manager found (paru, yay, or pacman required)."
 
   MSG[T_ORPHAN]="Checking for orphaned packages..."
-  MSG[ORPHAN_LIST]="%s orphans: %s"
-  MSG[ORPHAN_OPT_LIST]="%s required only as optional deps: %s"
-  MSG[ORPHAN_DEBUG_LIST]="orphaned debug packages: %s"
+  MSG[ORPHAN_SUMMARY]="The following %s packages will be removed (%s total):"
+  MSG[ORPHAN_GRP_HEAD]="%s: %s (%s)"
+  MSG[ORPHAN_GRP]="orphans (no longer required by anything)"
+  MSG[ORPHAN_GRP_OPT]="required only as optional deps"
+  MSG[ORPHAN_GRP_DEBUG]="orphaned debug packages"
+  MSG[ORPHAN_ASK]="Remove these packages? [y/N]"
+  MSG[ORPHAN_SKIPPED]="Kept all packages, nothing removed."
+  MSG[ORPHAN_FAIL]="Removal failed: %s"
   MSG[T_CACHE]="Cleaning package cache (%s)..."
   MSG[CACHE_ITEM]="old versions / uninstalled packages"
   MSG[CACHE_ALL_ITEM]="all %s files (run pacman -Sy before next operation)"
@@ -336,6 +347,12 @@ item() {
   if [[ "$bytes" -gt 0 ]]; then STEP_BYTES=$(( STEP_BYTES + bytes )); TOTAL_BYTES=$(( TOTAL_BYTES + bytes )); fi
 }
 note() { printf "%s  ${DIM}%s${NC}\n" "$INDENT" "$*"; }
+# account BYTES           -> count an entry that printed its own lines (BYTES=-1 when unknown)
+account() {
+  STEP_ITEMS=$(( STEP_ITEMS + 1 ))
+  if [[ "$1" -gt 0 ]]; then STEP_BYTES=$(( STEP_BYTES + $1 )); TOTAL_BYTES=$(( TOTAL_BYTES + $1 )); fi
+  return 0
+}
 skip() { _skip "$@"; }
 # step_end -> "[成功] 已清理 X。" / "[成功] 完成。" / "[成功] 无需清理。"  ([预览] in dry-run)
 step_end() {
@@ -360,6 +377,19 @@ pkgs_installed_bytes() {  # sum of "Installed Size" for the given packages (-1 w
     | numfmt --from=iec-i 2>/dev/null | awk '{s+=$1} END{print s+0}')
   if [[ "${s:-0}" -gt 0 ]]; then echo "$s"; else echo -1; fi
 }
+# "name<TAB>bytes<TAB>description" per package, largest first (bytes = 0 when unknown)
+pkg_rows() {
+  LC_ALL=C pacman -Qi "$@" 2>/dev/null | awk '
+      function val(l) { return substr(l, index(l, ":") + 2) }
+      /^Name[[:space:]]*:/           { n = val($0); d = "" }
+      /^Description[[:space:]]*:/    { d = val($0) }
+      /^Installed Size[[:space:]]*:/ { printf "%s\t%s\t%s\n", n, val($0), d }' \
+    | while IFS=$'\t' read -r n sz d; do
+        printf '%s\t%s\t%s\n' "$n" \
+          "$(numfmt --from=iec-i "$(echo "$sz" | sed 's/ //; s/iB$/i/; s/B$//')" 2>/dev/null || echo 0)" "$d"
+      done | sort -t$'\t' -k2,2nr -k1,1
+}
+term_cols() { local c="${COLUMNS:-0}"; [[ "$c" -gt 0 ]] || c=$(tput cols 2>/dev/null || echo 100); echo "$c"; }
 
 # ------------------------------
 # 5. Package manager detection
@@ -398,20 +428,42 @@ pkgbase_installed() {
 # 6. Steps  (each step lists what it removes; deletion is skipped in PREVIEW)
 # ======================================================================
 
+# one group of packages: header line + one line per package (name, size, description)
+orphan_group() {
+  local label=$1; shift
+  local -a rows=(); local -A listed=(); local row n sz d w=0 desc_col cols
+  mapfile -t rows < <(pkg_rows "$@")
+  printf "%s${DIM}-${NC} ${MSG[ORPHAN_GRP_HEAD]}\n" "$INDENT" "$label" "$#" "$(fmt_bytes "$(pkgs_installed_bytes "$@")")"
+  for n in "$@"; do [[ ${#n} -gt $w ]] && w=${#n}; done
+  [[ $w -gt 32 ]] && w=32
+  cols=$(term_cols); desc_col=$(( cols - ${#INDENT} - 4 - w - 12 ))
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r n sz d <<< "$row"
+    listed[$n]=1
+    [[ $desc_col -lt 12 ]] && d=""
+    [[ -n "$d" && ${#d} -gt $desc_col ]] && d="${d:0:$(( desc_col - 1 ))}…"
+    printf "%s    %-*s ${C_CYAN}%9s${NC}  ${DIM}%s${NC}\n" "$INDENT" "$w" "$n" "$(fmt_bytes "$sz")" "$d"
+  done
+  for n in "$@"; do   # no pacman -Qi entry (should not happen): at least show the name
+    [[ -n "${listed[$n]:-}" ]] || printf "%s    %-*s ${C_CYAN}%9s${NC}\n" "$INDENT" "$w" "$n" "-"
+  done
+}
+
 step_orphans() {
   step "${MSG[T_ORPHAN]}"
-  local -a targets=() arr=()
-  local orphans opt_orphans debugs base
+  local -a targets=() arr=() labels=() groups=()
+  local orphans opt_orphans debugs base dbg total out reply i
+
   orphans=$(pacman -Qtdq 2>/dev/null || true)
   if [[ -n "$orphans" ]]; then
     mapfile -t arr <<< "$orphans"; targets+=("${arr[@]}")
-    item "$(pkgs_installed_bytes "${arr[@]}")" "$(printf "${MSG[ORPHAN_LIST]}" "${#arr[@]}" "$(join_words "${arr[@]}")")"
+    labels+=("${MSG[ORPHAN_GRP]}"); groups+=("$(join_words "${arr[@]}")")
   fi
   if is_all; then
     opt_orphans=$(comm -13 <(pacman -Qtdq 2>/dev/null | sort) <(pacman -Qttdq 2>/dev/null | sort) || true)
     if [[ -n "$opt_orphans" ]]; then
       mapfile -t arr <<< "$opt_orphans"; targets+=("${arr[@]}")
-      item "$(pkgs_installed_bytes "${arr[@]}")" "$(printf "${MSG[ORPHAN_OPT_LIST]}" "${#arr[@]}" "$(join_words "${arr[@]}")")"
+      labels+=("${MSG[ORPHAN_GRP_OPT]}"); groups+=("$(join_words "${arr[@]}")")
     fi
   fi
   debugs=""
@@ -421,11 +473,32 @@ step_orphans() {
   done < <(pacman -Qq 2>/dev/null | grep -- '-debug$' || true)
   if [[ -n "$debugs" ]]; then
     read -r -a arr <<< "$debugs"; targets+=("${arr[@]}")
-    item "$(pkgs_installed_bytes "${arr[@]}")" "$(printf "${MSG[ORPHAN_DEBUG_LIST]}" "$debugs")"
+    labels+=("${MSG[ORPHAN_GRP_DEBUG]}"); groups+=("$debugs")
   fi
-  if [[ ${#targets[@]} -gt 0 ]]; then
-    run sudo pacman -Rns --noconfirm "${targets[@]}" >/dev/null 2>&1 || true
+
+  [[ ${#targets[@]} -eq 0 ]] && { step_end; return 0; }
+
+  # removing packages is not a cache cleanup: always show the full list, then ask
+  total=$(pkgs_installed_bytes "${targets[@]}")
+  printf "%s${MSG[ORPHAN_SUMMARY]}\n" "$INDENT" "${#targets[@]}" "$(fmt_bytes "$total")"
+  for i in "${!groups[@]}"; do
+    read -r -a arr <<< "${groups[$i]}"
+    orphan_group "${labels[$i]}" "${arr[@]}"
+  done
+
+  if [[ "$PREVIEW" == false && "$SKIP_CONFIRM" == false ]]; then
+    printf "%s${H_YELLOW}%s${NC} " "$INDENT" "${MSG[ORPHAN_ASK]}"
+    read -r reply || reply=""          # no tty / EOF -> keep the packages
+    [[ -t 0 ]] || printf "\n"           # a tty echoes the Enter key, a pipe does not
+    case "$reply" in [yY] | [yY][eE][sS]) ;; *) _skip "${MSG[ORPHAN_SKIPPED]}"; return 0 ;; esac
   fi
+  if [[ "$PREVIEW" == false ]]; then
+    if ! out=$(sudo pacman -Rns --noconfirm "${targets[@]}" 2>&1); then
+      _warn "${MSG[ORPHAN_FAIL]}" "$(printf '%s' "$out" | grep -v '^$' | tail -1)"
+      return 0
+    fi
+  fi
+  account "$total"
   step_end
 }
 
