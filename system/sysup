@@ -6,17 +6,28 @@
 set -euo pipefail
 
 # ===============================================================
-# Arch Linux 系统更新助手 (KISS 终极联动版 - 防部分升级 + 强制刷新)
+# Arch Linux 系统更新助手
+# 官方仓库 (pacman -Syu) 与 AUR 分开升级：
+#   - 官方仓库升级失败 = 部分升级状态，致命警告并退出
+#   - AUR 升级失败不影响系统完整性，仅提示并继续后续步骤
 # ===============================================================
 
 # ------------------------------
-# 1. Default parameters & KISS Language Detection
+# 1. Default parameters & Language Detection
 # ------------------------------
 COUNT_LIMIT=15
 NEWS_SOURCE="official"
 SHOW_LIST=0
+MIRROR_MAX_DAYS=30
 
-if [[ "${LC_MESSAGES:-${LANG:-}}" == *zh_CN* ]]; then
+# 按 gettext 的优先级判断：LC_ALL > LC_MESSAGES > LANG；
+# 非 C/POSIX locale 时 LANGUAGE (如 zh_CN:en) 优先生效
+MSG_LOCALE="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+if [[ -n "${LANGUAGE:-}" && ! "$MSG_LOCALE" =~ ^(C|POSIX)?(\.|$) ]]; then
+  MSG_LOCALE="${LANGUAGE%%:*}"
+fi
+
+if [[ "$MSG_LOCALE" == zh_CN* ]]; then
   UI_LANG="zh"
 else
   UI_LANG="en"
@@ -40,29 +51,28 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  -l, --list               Launch list (checkallupdates) before updates
-  --ui-lang zh|en          UI language (default: auto)
+  -l, --list                 Refresh and open the pending updates list (no update is performed)
+  --ui-lang zh|en            UI language (default: auto)
   --news-source official|cn  News source (default: official)
-  --count N                Max number of news items (default: 15)
-  --help, -h               Show this help and exit
+  --count N                  Max number of news items (default: 15)
+  --help, -h                 Show this help and exit
 EOF
+}
+
+die_usage() {
+  printf "Error: %s\n\n" "$1" >&2
+  usage >&2
+  exit 1
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-  -l | --list) SHOW_LIST=1; shift 1 ;;
-  --ui-lang) [[ -n "${2:-}" ]] && UI_LANG="$2" && shift 2 || exit 1 ;;
-  --news-source) [[ -n "${2:-}" ]] && NEWS_SOURCE="$2" && shift 2 || exit 1 ;;
-  --count) [[ -n "${2:-}" ]] && COUNT_LIMIT="$2" && shift 2 || exit 1 ;;
-  --help | -h)
-    usage
-    exit 0
-    ;;
-  *)
-    printf "Unknown option: %s\n" "$1"
-    usage
-    exit 1
-    ;;
+  -l | --list) SHOW_LIST=1; shift ;;
+  --ui-lang) [[ "${2:-}" =~ ^(zh|en)$ ]] && UI_LANG="$2" && shift 2 || die_usage "--ui-lang requires zh or en." ;;
+  --news-source) [[ "${2:-}" =~ ^(official|cn)$ ]] && NEWS_SOURCE="$2" && shift 2 || die_usage "--news-source requires official or cn." ;;
+  --count) [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] && COUNT_LIMIT="$2" && shift 2 || die_usage "--count requires a positive number." ;;
+  --help | -h) usage; exit 0 ;;
+  *) die_usage "Unknown option: $1" ;;
   esac
 done
 
@@ -77,50 +87,71 @@ if [[ "$UI_LANG" == "zh" ]]; then
   TAG_ERROR="[错误]"
 
   MSG[SYNCING_DATA]="⏳ 正在同步最新软件库数据，请稍候..."
+  MSG[NO_UI]="未找到更新列表命令 (shorin checkallupdates)，请确认已安装 shorin-contrib。"
 
   MSG[INTRO_HEADER]="=== Arch Linux 系统更新助手 ==="
-  MSG[INTRO_DESC]="本脚本将执行以下操作："
-  MSG[INTRO_1]="1. 获取最新 Arch Linux 新闻"
-  MSG[INTRO_2]="2. 检查镜像源时效并按需更新"
-  MSG[INTRO_3]="3. 同步软件数据库并更新 GPG 密钥环"
-  MSG[INTRO_4]="4. 升级系统软件包 (交互模式防冲突)"
-  MSG[INTRO_5]="5. 更新 Flatpak 应用"
-  MSG[INTRO_6]="6. 重新生成 GRUB 配置文件"
+  MSG[INTRO_DESC]="获取并确认 Arch Linux 新闻后，将依次执行："
+  INTRO_STEPS=(
+    "检查镜像源时效并按需更新"
+    "同步软件数据库并更新 GPG 密钥环"
+    "升级官方仓库软件包 (pacman -Su)"
+    "升级 AUR 软件包"
+    "更新 Flatpak 应用"
+    "重新生成 GRUB 配置文件"
+  )
+  MSG[INTRO_SNAP]="(Btrfs 系统且安装了 quicksave 时，会先创建快照)"
 
   MSG[REQ_SUDO]="正在请求管理员权限以更新系统..."
   MSG[SUDO_FAIL]="需要管理员权限才能更新系统。已退出。"
-  MSG[NO_HELPER]="未找到 AUR 助手 (paru 或 yay)"
-  MSG[NO_UI]="未找到前端列表脚本 (shorin checkallupdates)，请确认安装shorin-contrib-git。"
-  
-  MSG[PREPARING]="准备使用 %s 更新系统..."
+
+  MSG[PREPARING]="准备更新系统 (%s)..."
   MSG[FETCHING]="正在获取 Arch Linux 新闻..."
   MSG[NEWS_HEADER]="最近 {0} 条 Arch Linux 新闻："
-  MSG[CONFIRM]="请阅读上述新闻。确认使用 %s 开始更新吗？[Y/n]"
+  MSG[CONFIRM]="请阅读上述新闻。确认开始更新吗？"
   MSG[CANCEL]="更新已取消。"
   MSG[ERR_FETCH]="获取新闻失败（网络或源错误）"
-  MSG[FORCE_ASK]="是否忽略新闻强制更新？[y/N]"
+  MSG[FORCE_ASK]="是否忽略新闻强制更新？"
   MSG[FORCING]="正在强制更新..."
   MSG[EXIT]="安全退出。"
 
-  MSG[SNAP]="[0/6] 正在创建 Btrfs 快照..."
-  MSG[STEP_MIRROR]="[1/6] 检查镜像源时效性..."
-  MSG[STEP_1]="[2/6] 同步数据库并更新密钥环..."
-  MSG[KEYRING_OK]="数据库与密钥环已同步。"
-  MSG[KEYRING_WARN]="密钥环更新遇到问题，继续尝试系统更新..."
-  MSG[STEP_2]="[3/6] 正在升级系统..."
-  MSG[STEP_3]="[4/6] 检查 Flatpak 更新..."
-  MSG[STEP_4]="[5/6] 更新 GRUB 配置..."
-  MSG[GRUB_OK]="GRUB 更新成功。"
-  MSG[GRUB_FAIL]="GRUB 更新失败。"
+  MSG[SNAP]="正在创建 Btrfs 快照..."
+  MSG[SNAP_FAIL]="Btrfs 快照创建失败。是否在没有快照的情况下继续？"
 
-  MSG[MIR_OLD]="镜像源已 %s 天未更新 (>30天)。是否更新？[Y/n]"
+  MSG[STEP_MIRROR]="检查镜像源时效性..."
+  MSG[MIR_OLD]="镜像源已 %s 天未更新 (>%s天)。是否更新？"
   MSG[MIR_FRESH]="镜像源很新鲜 (生成于 %s 天前)。"
   MSG[MIR_UPDATING]="正在运行镜像更新脚本..."
+  MSG[MIR_UPDATE_FAIL]="镜像更新脚本执行失败，继续使用当前镜像源。"
   MSG[MIR_SKIP]="跳过镜像源更新。"
-  MSG[MIR_NO_FILE]="未找到 Reflector 时间标记，跳过检查。"
-  MSG[MIR_NO_SCRIPT]="错误：未在 %s 找到更新脚本。"
+  MSG[MIR_NO_STAMP]="镜像源不是由 Reflector 生成，跳过检查。"
+  MSG[MIR_BAD_STAMP]="无法解析 Reflector 时间标记，跳过检查。"
+  MSG[MIR_NO_SCRIPT]="未找到 mirror-update 脚本，跳过镜像源更新。"
 
-  MSG[WARN_PARTIAL_TITLE]="[致命警告] 系统更新被中断或发生冲突失败！"
+  MSG[STEP_SYNC]="同步数据库并更新密钥环..."
+  MSG[KEYRING_OK]="数据库与密钥环已同步。"
+  MSG[KEYRING_WARN]="密钥环更新遇到问题，继续尝试系统更新..."
+
+  MSG[STEP_REPO]="正在升级官方仓库软件包..."
+  MSG[REPO_OK]="官方仓库软件包已全部升级，系统处于完整状态。"
+
+  MSG[STEP_AUR]="正在升级 AUR 软件包 (%s)..."
+  MSG[AUR_OK]="AUR 软件包已升级。"
+  MSG[AUR_NONE]="未找到 AUR 助手 (paru 或 yay)，跳过。"
+  MSG[AUR_FAIL]="AUR 软件包升级失败或被取消。官方仓库已完成升级，系统本身是完整的。"
+  MSG[AUR_RETRY]="排查问题后可单独重试：%s"
+
+  MSG[STEP_FLATPAK]="检查 Flatpak 更新..."
+  MSG[FLATPAK_NONE]="未安装 Flatpak，跳过。"
+  MSG[FLATPAK_FAIL]="Flatpak 更新失败，继续后续步骤。"
+
+  MSG[STEP_GRUB]="更新 GRUB 配置..."
+  MSG[GRUB_OK]="GRUB 更新成功。"
+  MSG[GRUB_FAIL]="GRUB 更新失败。"
+  MSG[GRUB_NONE]="未找到 grub-mkconfig，跳过。"
+
+  MSG[DONE]="系统更新完成。"
+
+  MSG[WARN_PARTIAL_TITLE]="[致命警告] 官方仓库升级被中断或发生冲突失败！"
   MSG[WARN_PARTIAL_1]="您的本地软件库数据库已被更新，但软件包尚未成功升级。"
   MSG[WARN_PARTIAL_2]="【绝对禁止】在此状态下运行 pacman -S 安装新软件，这会导致部分升级进而损坏系统！"
   MSG[WARN_PARTIAL_3]="请尽快排查冲突原因，并重新运行 sysup 完成系统升级。"
@@ -131,86 +162,116 @@ else
   TAG_ERROR="[ERROR]"
 
   MSG[SYNCING_DATA]="⏳ Triggering sync for the latest repository data. Please wait..."
+  MSG[NO_UI]="Update list command not found (shorin checkallupdates). Is shorin-contrib installed?"
 
   MSG[INTRO_HEADER]="=== Arch Linux System Update Assistant ==="
-  MSG[INTRO_DESC]="Actions to perform:"
-  MSG[INTRO_1]="1. Fetch latest Arch Linux news"
-  MSG[INTRO_2]="2. Check mirrorlist age & Update if needed"
-  MSG[INTRO_3]="3. Sync Pacman DB & Update GPG Keyrings"
-  MSG[INTRO_4]="4. Upgrade system packages (Interactive)"
-  MSG[INTRO_5]="5. Update Flatpak apps"
-  MSG[INTRO_6]="6. Re-generate GRUB config"
+  MSG[INTRO_DESC]="After fetching and confirming Arch Linux news, the following steps run:"
+  INTRO_STEPS=(
+    "Check mirrorlist age & update if needed"
+    "Sync pacman DB & update GPG keyrings"
+    "Upgrade official repo packages (pacman -Su)"
+    "Upgrade AUR packages"
+    "Update Flatpak apps"
+    "Re-generate GRUB config"
+  )
+  MSG[INTRO_SNAP]="(A snapshot is taken first on Btrfs when quicksave is installed)"
 
   MSG[REQ_SUDO]="Requesting sudo..."
   MSG[SUDO_FAIL]="Sudo privileges required. Exiting..."
-  MSG[NO_HELPER]="No AUR helper found (paru or yay)"
-  MSG[NO_UI]="Frontend UI script not found (shorin-check-arch-updates)."
-  
-  MSG[PREPARING]="Preparing update with %s..."
+
+  MSG[PREPARING]="Preparing update (%s)..."
   MSG[FETCHING]="Fetching news..."
   MSG[NEWS_HEADER]="Recent {0} Arch Linux news items:"
-  MSG[CONFIRM]="Proceed with %s? [Y/n]"
+  MSG[CONFIRM]="Please read the news above. Proceed with the update?"
   MSG[CANCEL]="Update cancelled."
   MSG[ERR_FETCH]="Failed to fetch news"
-  MSG[FORCE_ASK]="Force update anyway? [y/N]"
+  MSG[FORCE_ASK]="Force update anyway?"
   MSG[FORCING]="Forcing update..."
   MSG[EXIT]="Safe exit."
 
-  MSG[SNAP]="[0/6] Creating Btrfs Snapshot..."
-  MSG[STEP_MIRROR]="[1/6] Checking mirrorlist age..."
-  MSG[STEP_1]="[2/6] Sync DB & Keyrings"
-  MSG[KEYRING_OK]="DB & Keyrings synced."
-  MSG[KEYRING_WARN]="Keyring issues detected..."
-  MSG[STEP_2]="[3/6] Upgrading system..."
-  MSG[STEP_3]="[4/6] Checking Flatpak updates"
-  MSG[STEP_4]="[5/6] Updating GRUB"
-  MSG[GRUB_OK]="GRUB updated."
-  MSG[GRUB_FAIL]="GRUB update failed."
+  MSG[SNAP]="Creating Btrfs snapshot..."
+  MSG[SNAP_FAIL]="Btrfs snapshot failed. Continue without a snapshot?"
 
-  MSG[MIR_OLD]="Mirrors are %s days old (>30). Update? [Y/n]"
+  MSG[STEP_MIRROR]="Checking mirrorlist age..."
+  MSG[MIR_OLD]="Mirrors are %s days old (>%s). Update?"
   MSG[MIR_FRESH]="Mirrors are fresh (%s days old)."
   MSG[MIR_UPDATING]="Running mirror-update script..."
+  MSG[MIR_UPDATE_FAIL]="mirror-update failed. Keeping the current mirrorlist."
   MSG[MIR_SKIP]="Skipping mirror update."
-  MSG[MIR_NO_FILE]="No Reflector timestamp found. Skipping."
-  MSG[MIR_NO_SCRIPT]="Error: mirror-update script not found at %s"
+  MSG[MIR_NO_STAMP]="Mirrorlist was not generated by Reflector. Skipping."
+  MSG[MIR_BAD_STAMP]="Cannot parse the Reflector timestamp. Skipping."
+  MSG[MIR_NO_SCRIPT]="mirror-update script not found. Skipping mirror update."
 
-  MSG[WARN_PARTIAL_TITLE]="[CRITICAL] System update interrupted or failed!"
+  MSG[STEP_SYNC]="Syncing DB & keyrings..."
+  MSG[KEYRING_OK]="DB & keyrings synced."
+  MSG[KEYRING_WARN]="Keyring issues detected, continuing with system upgrade..."
+
+  MSG[STEP_REPO]="Upgrading official repo packages..."
+  MSG[REPO_OK]="Official repo packages upgraded. The system is fully up to date."
+
+  MSG[STEP_AUR]="Upgrading AUR packages (%s)..."
+  MSG[AUR_OK]="AUR packages upgraded."
+  MSG[AUR_NONE]="No AUR helper found (paru or yay). Skipping."
+  MSG[AUR_FAIL]="AUR upgrade failed or was cancelled. Official repos are upgraded; the system itself is consistent."
+  MSG[AUR_RETRY]="Retry later with: %s"
+
+  MSG[STEP_FLATPAK]="Checking Flatpak updates..."
+  MSG[FLATPAK_NONE]="Flatpak not installed. Skipping."
+  MSG[FLATPAK_FAIL]="Flatpak update failed. Continuing."
+
+  MSG[STEP_GRUB]="Updating GRUB..."
+  MSG[GRUB_OK]="GRUB updated."
+  MSG[GRUB_FAIL]="GRUB update failed."
+  MSG[GRUB_NONE]="grub-mkconfig not found. Skipping."
+
+  MSG[DONE]="System update finished."
+
+  MSG[WARN_PARTIAL_TITLE]="[CRITICAL] Official repo upgrade interrupted or failed!"
   MSG[WARN_PARTIAL_1]="Local databases are updated, but packages are not."
   MSG[WARN_PARTIAL_2]="[DANGER] DO NOT install new packages (pacman -S) in this state! It will cause a partial upgrade."
   MSG[WARN_PARTIAL_3]="Please resolve any conflicts and run sysup again ASAP."
 fi
 
 # ------------------------------
-# 5. Logging Functions
+# 5. Logging & Prompt Functions
 # ------------------------------
 _log()     { local fmt=$1; shift; printf "${H_BLUE}${TAG_INFO}${NC} ${fmt}\n" "$@"; }
 _success() { local fmt=$1; shift; printf "${H_GREEN}${TAG_SUCCESS}${NC} ${fmt}\n" "$@"; }
 _warn()    { local fmt=$1; shift; printf "${H_YELLOW}${TAG_WARN}${NC} ${fmt}\n" "$@"; }
 _error()   { local fmt=$1; shift; printf "${H_RED}${TAG_ERROR}${NC} ${fmt}\n" "$@"; exit 1; }
 
+STEP_TOTAL=${#INTRO_STEPS[@]}
+STEP_NUM=0
+_step() { STEP_NUM=$((STEP_NUM + 1)); _log "[%d/%d] ${1}" "$STEP_NUM" "$STEP_TOTAL" "${@:2}"; }
+
+# ask <Y|N> <message>：返回 0 表示"是"。输入读取失败 (EOF / 非终端) 一律视为"否"。
+ask() {
+  local default=$1 msg=$2 hint answer
+  [[ "$default" == "Y" ]] && hint="[Y/n]" || hint="[y/N]"
+  printf "%s %s " "$msg" "$hint"
+  if ! read -r answer; then
+    printf "\n"
+    return 1
+  fi
+  answer=${answer:-$default}
+  [[ "$answer" =~ ^[Yy] ]]
+}
+
 # ===============================================================
-# 【完美联动防线】：处理 -l 选项，强制刷新缓存后优雅交接给前端 UI
+# -l：唤醒 Waybar 后台脚本刷新缓存，等待其写完后打开更新列表
 # ===============================================================
 if [[ $SHOW_LIST == 1 ]]; then
   printf "\n${H_CYAN}%s${NC}\n" "${MSG[SYNCING_DATA]}"
-  
-  # 1. 唤醒 Waybar 后台守护进程去拉取最新数据
+
+  # 唤醒 Waybar 守护进程拉取最新数据，短暂避让让它先拿到文件锁
   pkill -SIGUSR1 -f "check-updates.sh" || true
-  
-  # 2. 短暂避让，确保 Waybar 脚本的 trap 机制顺利拿到文件锁
   sleep 0.2
-  
-  # 3. 阻塞等待：复用 Waybar 锁文件。直到 Waybar 写完最新缓存释放锁，这里才会放行。
+
+  # 复用 Waybar 锁文件阻塞等待：锁被释放即代表缓存已是最新
   ( flock -x -w 120 9 ) 9>"/tmp/waybar-updates.lock" || true
 
-  # 4. 数据绝对新鲜，移交控制权给前端列表界面 (由于缓存是最新的，fzf 会极速秒开)
-  if command -v shorin-check-arch-updates >/dev/null 2>&1; then
-    exec shorin-check-arch-updates
-  elif command -v shorin >/dev/null 2>&1; then
-    exec shorin checkallupdates
-  else
-    _error "${MSG[NO_UI]}"
-  fi
+  command -v shorin >/dev/null 2>&1 || _error "${MSG[NO_UI]}"
+  exec shorin checkallupdates
 fi
 
 # ------------------------------
@@ -219,125 +280,114 @@ fi
 clear
 printf "\n${H_CYAN}%s${NC}\n" "${MSG[INTRO_HEADER]}"
 printf "%s\n" "${MSG[INTRO_DESC]}"
-printf "  %s\n" "${MSG[INTRO_1]}"
-printf "  %s\n" "${MSG[INTRO_2]}"
-printf "  %s\n" "${MSG[INTRO_3]}"
-printf "  %s\n" "${MSG[INTRO_4]}"
-printf "  %s\n" "${MSG[INTRO_5]}"
-printf "  %s\n\n" "${MSG[INTRO_6]}"
+for i in "${!INTRO_STEPS[@]}"; do
+  printf "  %d. %s\n" "$((i + 1))" "${INTRO_STEPS[$i]}"
+done
+printf "  %s\n\n" "${MSG[INTRO_SNAP]}"
 
 _log "${MSG[REQ_SUDO]}"
-if ! sudo -v; then
-  _error "${MSG[SUDO_FAIL]}"
-fi
+sudo -v || _error "${MSG[SUDO_FAIL]}"
 
 while true; do
   sudo -n true
   sleep 60
-done 2>/dev/null &
+done >/dev/null 2>&1 &
 SUDO_PID=$!
 trap 'kill $SUDO_PID 2>/dev/null || true' EXIT
 
 # ------------------------------
-# 7. Check AUR Helper
+# 7. Detect AUR Helper (optional)
 # ------------------------------
-UPDATE_CMD=""
+AUR_HELPER=""
+AUR_ARGS=()
 if command -v paru >/dev/null 2>&1; then
-  UPDATE_CMD="paru"
+  AUR_HELPER="paru"
+  AUR_ARGS=(-Sua --skipreview)
 elif command -v yay >/dev/null 2>&1; then
-  UPDATE_CMD="yay"
-else
-  _error "${MSG[NO_HELPER]}"
+  AUR_HELPER="yay"
+  AUR_ARGS=(-Sua --answeredit None)
 fi
 
 # ------------------------------
-# Mirror Check Function
+# 8. Update Steps
 # ------------------------------
-check_mirror_age() {
-  _log "${MSG[STEP_MIRROR]}"
-  local MIRROR_LIST="/etc/pacman.d/mirrorlist"
-  local THRESHOLD=$((30 * 24 * 60 * 60))
-  local UPDATE_SCRIPT="$HOME/.local/bin/mirror-update"
+take_snapshot() {
+  command -v quicksave >/dev/null 2>&1 || return 0
+  [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]] || return 0
 
-  if [[ -f /etc/os-release ]]; then . /etc/os-release; fi
-  if [[ "${ID:-}" != "arch" ]] && [[ ! "${ID_LIKE:-}" =~ arch ]]; then return; fi
-
-  if [[ -f "$MIRROR_LIST" ]] && grep -q "^# When:" "$MIRROR_LIST"; then
-    local when_str
-    when_str=$(grep "^# When:" "$MIRROR_LIST" | cut -d':' -f2- | sed 's/ UTC//g' | xargs || true)
-    
-    local file_ts current_ts
-    file_ts=$(date -u -d "$when_str" +%s 2>/dev/null || echo 0)
-    current_ts=$(date +%s)
-
-    if [[ "$file_ts" -gt 0 ]]; then
-      local diff=$((current_ts - file_ts))
-      local days_old=$((diff / 86400))
-
-      if [[ "$diff" -gt "$THRESHOLD" ]]; then
-        printf "${H_YELLOW}${TAG_WARN}${NC} "
-        printf "${MSG[MIR_OLD]} " "$days_old"
-        local choice; read -r choice || true
-        choice=${choice:-Y}
-
-        if [[ "$choice" =~ ^[Yy]$ ]]; then
-          if [[ -x "$UPDATE_SCRIPT" ]]; then
-            _log "${MSG[MIR_UPDATING]}"
-            "$UPDATE_SCRIPT"
-          else
-            _error "${MSG[MIR_NO_SCRIPT]}" "$UPDATE_SCRIPT"
-          fi
-        else
-          _log "${MSG[MIR_SKIP]}"
-        fi
-      else
-        printf "${H_BLUE}${TAG_INFO}${NC} "
-        printf "${MSG[MIR_FRESH]}\n" "$days_old"
-      fi
-    else
-      _warn "${MSG[MIR_NO_FILE]}"
-    fi
-  else
-    _log "${MSG[MIR_NO_FILE]}"
+  _log "${MSG[SNAP]}"
+  if ! quicksave -d quicksave-sysup; then
+    printf "${H_YELLOW}${TAG_WARN}${NC} "
+    ask N "${MSG[SNAP_FAIL]}" || { _log "${MSG[EXIT]}"; exit 1; }
   fi
 }
 
-# ------------------------------
-# 8. Update Function (防部分升级核心)
-# ------------------------------
-perform_update() {
-  if command -v quicksave >/dev/null 2>&1 && [[ "$(findmnt -no FSTYPE /)" == "btrfs" ]]; then 
-      _log "${MSG[SNAP]}"
-      quicksave -d quicksave-sysup
+find_mirror_script() {
+  if command -v mirror-update >/dev/null 2>&1; then
+    command -v mirror-update
+  elif [[ -x /usr/lib/shorin-contrib/mirror-update ]]; then
+    printf "%s\n" /usr/lib/shorin-contrib/mirror-update
+  else
+    return 1
+  fi
+}
+
+check_mirror_age() {
+  _step "${MSG[STEP_MIRROR]}"
+  local mirror_list="/etc/pacman.d/mirrorlist"
+  local when_str file_ts days_old script
+
+  when_str=$(sed -n 's/^# When:[[:space:]]*//p;T;q' "$mirror_list" 2>/dev/null || true)
+  if [[ -z "$when_str" ]]; then
+    _log "${MSG[MIR_NO_STAMP]}"
+    return
   fi
 
-  check_mirror_age
+  if ! file_ts=$(date -u -d "${when_str% UTC}" +%s 2>/dev/null); then
+    _warn "${MSG[MIR_BAD_STAMP]}"
+    return
+  fi
 
-  _log "${MSG[STEP_1]}"
-  local KEYRING_TARGETS=("archlinux-keyring")
+  days_old=$((($(date +%s) - file_ts) / 86400))
+  if ((days_old <= MIRROR_MAX_DAYS)); then
+    _log "${MSG[MIR_FRESH]}" "$days_old"
+    return
+  fi
+
+  printf "${H_YELLOW}${TAG_WARN}${NC} "
+  # shellcheck disable=SC2059
+  if ! ask Y "$(printf "${MSG[MIR_OLD]}" "$days_old" "$MIRROR_MAX_DAYS")"; then
+    _log "${MSG[MIR_SKIP]}"
+    return
+  fi
+
+  if ! script=$(find_mirror_script); then
+    _warn "${MSG[MIR_NO_SCRIPT]}"
+    return
+  fi
+
+  _log "${MSG[MIR_UPDATING]}"
+  "$script" || _warn "${MSG[MIR_UPDATE_FAIL]}"
+}
+
+sync_keyrings() {
+  _step "${MSG[STEP_SYNC]}"
+  local targets=("archlinux-keyring")
   if grep -q "^\[archlinuxcn\]" /etc/pacman.conf; then
-    KEYRING_TARGETS+=("archlinuxcn-keyring")
+    targets+=("archlinuxcn-keyring")
   fi
 
-  if sudo pacman -Sy --needed --noconfirm "${KEYRING_TARGETS[@]}"; then
+  if sudo pacman -Sy --needed --noconfirm "${targets[@]}"; then
     _success "${MSG[KEYRING_OK]}"
   else
     _warn "${MSG[KEYRING_WARN]}"
   fi
+}
 
-  _log "${MSG[STEP_2]}"
-  
-  # ===============================================================
-  # 【致命警告防线】：强制交互模式并捕获错误
-  # ===============================================================
-  local UPDATE_ARGS=(-Su)
-  if [[ "$UPDATE_CMD" == "paru" ]]; then
-    UPDATE_ARGS+=(--skipreview)
-  elif [[ "$UPDATE_CMD" == "yay" ]]; then
-    UPDATE_ARGS+=(--answeredit None)
-  fi
-
-  if ! "$UPDATE_CMD" "${UPDATE_ARGS[@]}"; then
+# 【防部分升级核心】数据库已在上一步同步，这里失败即处于部分升级状态
+upgrade_repos() {
+  _step "${MSG[STEP_REPO]}"
+  if ! sudo pacman -Su; then
     printf "\n${H_RED}======================================================================${NC}\n"
     printf "${H_RED}%s${NC}\n" "${MSG[WARN_PARTIAL_TITLE]}"
     printf "${H_YELLOW}• %s${NC}\n" "${MSG[WARN_PARTIAL_1]}"
@@ -346,33 +396,68 @@ perform_update() {
     printf "${H_RED}======================================================================${NC}\n\n"
     exit 1
   fi
+  _success "${MSG[REPO_OK]}"
+}
 
-  if command -v flatpak >/dev/null 2>&1; then
-    _log "${MSG[STEP_3]}"
-    flatpak update -y
+upgrade_aur() {
+  if [[ -z "$AUR_HELPER" ]]; then
+    _step "${MSG[STEP_AUR]}" "-"
+    _log "${MSG[AUR_NONE]}"
+    return
   fi
 
-  _log "${MSG[STEP_4]}"
-  if command -v grub-mkconfig >/dev/null 2>&1; then
-    if sudo env LANG=en_US.UTF-8 grub-mkconfig -o /boot/grub/grub.cfg; then
-      _success "${MSG[GRUB_OK]}"
-    else
-      _warn "${MSG[GRUB_FAIL]}"
-    fi
+  _step "${MSG[STEP_AUR]}" "$AUR_HELPER"
+  if "$AUR_HELPER" "${AUR_ARGS[@]}"; then
+    _success "${MSG[AUR_OK]}"
   else
-    _warn "grub-mkconfig not found. Skipping GRUB update."
+    _warn "${MSG[AUR_FAIL]}"
+    _warn "${MSG[AUR_RETRY]}" "$AUR_HELPER -Sua"
   fi
+}
+
+update_flatpak() {
+  _step "${MSG[STEP_FLATPAK]}"
+  if ! command -v flatpak >/dev/null 2>&1; then
+    _log "${MSG[FLATPAK_NONE]}"
+    return
+  fi
+  flatpak update -y || _warn "${MSG[FLATPAK_FAIL]}"
+}
+
+update_grub() {
+  _step "${MSG[STEP_GRUB]}"
+  if ! command -v grub-mkconfig >/dev/null 2>&1; then
+    _log "${MSG[GRUB_NONE]}"
+    return
+  fi
+
+  # 菜单项保持英文 (GRUB 默认字体无中文)。必须用 LC_ALL=C.UTF-8：
+  # 仅设 LANG 时，sudo 保留下来的 LANGUAGE=zh_CN:en 仍会让 gettext 输出中文
+  if sudo env -u LANGUAGE LC_ALL=C.UTF-8 grub-mkconfig -o /boot/grub/grub.cfg; then
+    _success "${MSG[GRUB_OK]}"
+  else
+    _warn "${MSG[GRUB_FAIL]}"
+  fi
+}
+
+perform_update() {
+  take_snapshot
+  check_mirror_age
+  sync_keyrings
+  upgrade_repos
+  upgrade_aur
+  update_flatpak
+  update_grub
 
   pkill -SIGUSR1 -f "check-updates.sh" || true
+  printf "\n"
+  _success "${MSG[DONE]}"
 }
 
 # ------------------------------
-# 9. Main Execution
+# 9. News
 # ------------------------------
-_log "${MSG[PREPARING]}" "$UPDATE_CMD"
-_log "${MSG[FETCHING]}"
-
-PYTHON_SCRIPT=$(
+NEWS_PARSER=$(
   cat <<'EOF'
 import sys
 import xml.etree.ElementTree as ET
@@ -426,32 +511,28 @@ else
   NEWS_URL="https://archlinux.org/feeds/news/"
 fi
 
-if curl -sS -L --connect-timeout 15 -A "Mozilla/5.0" "$NEWS_URL" |
-  python -c "$PYTHON_SCRIPT" "$COUNT_LIMIT" "${MSG[NEWS_HEADER]}"; then
+# ------------------------------
+# 10. Main Execution
+# ------------------------------
+_log "${MSG[PREPARING]}" "pacman${AUR_HELPER:+ + $AUR_HELPER}"
+_log "${MSG[FETCHING]}"
 
+if curl -fsSL --connect-timeout 15 --max-time 30 -A "Mozilla/5.0" "$NEWS_URL" |
+  python -c "$NEWS_PARSER" "$COUNT_LIMIT" "${MSG[NEWS_HEADER]}"; then
   printf "\n"
-  printf "${MSG[CONFIRM]} " "$UPDATE_CMD"
-  read -r confirm || true
-  case "$confirm" in
-  [Yy]* | "") perform_update ;;
-  *)
+  if ask Y "${MSG[CONFIRM]}"; then
+    perform_update
+  else
     _warn "${MSG[CANCEL]}"
-    exit 0
-    ;;
-  esac
+  fi
 else
   printf "\n"
   _warn "${MSG[ERR_FETCH]}"
-  printf "${MSG[FORCE_ASK]} "
-  read -r force_confirm || true
-  case "$force_confirm" in
-  [Yy]*)
+  if ask N "${MSG[FORCE_ASK]}"; then
     _warn "${MSG[FORCING]}"
     perform_update
-    ;;
-  *)
+  else
     _log "${MSG[EXIT]}"
     exit 1
-    ;;
-  esac
+  fi
 fi
